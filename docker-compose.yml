@@ -16,6 +16,8 @@ services:
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       GROK2API_DATABASE_URL: "${GROK2API_DATABASE_URL:-}"
+      # 可选：覆盖 config.yaml 中的质量重试速度阈值，0 表示关闭。
+      GROK2API_MAX_OUTPUT_TOKENS_PER_SECOND: "${GROK2API_MAX_OUTPUT_TOKENS_PER_SECOND:-}"
       GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
     volumes:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"

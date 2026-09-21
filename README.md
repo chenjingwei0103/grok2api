@@ -433,9 +433,12 @@ qualityGuard:
     onExhausted: fail_closed # fail_open | fail_closed
     accountCooldown: 12h
     idleAccountCooldown: 15m
+    # A terminal stream at or above this output Token/s is withheld and retried.
+    # Set GROK2API_MAX_OUTPUT_TOKENS_PER_SECOND to override; 0 disables it.
+    maxOutputTokensPerSecond: 500
 ```
 
-`requestRetry` runs on the gateway request path and is independent of the sidecar. This fork enables it. A thinking-model stream with enough visible output and no streamed reasoning is **not delivered**; another account is tried. TUI follow-ups (`previous_response_id`) and hosted-tool turns stay held — the first attempt stays pinned, a withhold unpins and rotates. Image, video, and ForcedEgress probe requests are unchanged. If every attempt still has no reasoning, `onExhausted` either returns `503 quality_degraded` or delivers the last body.
+`requestRetry` runs on the gateway request path and is independent of the sidecar. This fork enables it. A thinking-model stream with enough visible output and no streamed reasoning is **not delivered**; another account is tried. A terminal stream at or above `maxOutputTokensPerSecond` is treated the same way. TUI follow-ups (`previous_response_id`) and hosted-tool turns stay held — the first attempt stays pinned, a withhold unpins and rotates. Image, video, and ForcedEgress probe requests are unchanged. If every attempt still has no reasoning or exceeds the speed threshold, `onExhausted` either returns `503 quality_degraded` or delivers the last body.
 
 ```bash
 docker compose up -d

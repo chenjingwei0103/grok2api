@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 
 const (
 	DatabaseURLEnv                = "GROK2API_DATABASE_URL"
+	MaxOutputTokensPerSecondEnv   = "GROK2API_MAX_OUTPUT_TOKENS_PER_SECOND"
 	StatsigModeManual             = "manual"
 	StatsigModeURL                = "url"
 	ClearanceModeManual           = "manual"
@@ -404,6 +407,13 @@ func Load(path string) (Config, error) {
 // overrides after YAML and before CLI overrides. Empty values are ignored so
 // Compose can pass an optional variable without changing existing deployments.
 func applyEnvironmentOverrides(cfg *Config) error {
+	if value := strings.TrimSpace(os.Getenv(MaxOutputTokensPerSecondEnv)); value != "" {
+		threshold, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(threshold) || math.IsInf(threshold, 0) {
+			return fmt.Errorf("%s 必须是有限数字（0 表示关闭）", MaxOutputTokensPerSecondEnv)
+		}
+		cfg.QualityGuard.RequestRetry.MaxOutputTokensPerSecond = threshold
+	}
 	value := strings.TrimSpace(os.Getenv(DatabaseURLEnv))
 	if value == "" {
 		return nil
@@ -961,7 +971,7 @@ func defaultConfig() Config {
 				Enabled:     true,
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
-				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4, MaxOutputTokensPerSecond: 1000,
+				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4, MaxOutputTokensPerSecond: 500,
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
