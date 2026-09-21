@@ -139,12 +139,15 @@ type Usage struct {
 	Reported bool
 	// OutputObserved records that the transport actually forwarded generated
 	// content even when an interrupted upstream never emitted final usage.
-	OutputObserved         bool
-	InputTokens            int64
-	CachedInputTokens      int64
-	OutputTokens           int64
-	ReasoningTokens        int64
-	TotalTokens            int64
+	OutputObserved    bool
+	InputTokens       int64
+	CachedInputTokens int64
+	OutputTokens      int64
+	ReasoningTokens   int64
+	TotalTokens       int64
+	// OutputTokensPerSecond is populated by the quality hold scanner for
+	// request-path diagnostics; normal billing finalization ignores it.
+	OutputTokensPerSecond  float64
 	CostInUSDTicks         int64
 	NumSourcesUsed         int64
 	NumServerSideToolsUsed int64
@@ -1660,7 +1663,7 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "output_tokens_per_second", peekUsage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
 					continue
 				case QualityActionReject:
 					_ = response.Body.Close()
@@ -1671,11 +1674,11 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID)
+					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID, "output_tokens_per_second", peekUsage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)
-					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens)
+					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "output_tokens_per_second", peekUsage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
 				case QualityActionDeliver:
 					discardFallback(true)
 				}

@@ -175,3 +175,6 @@ qualityGuard:
     idleAccountCooldown: 15m
     minEncryptedBytes: 256
     encryptedBytesPerReasoningToken: 4
+    # 终止流的输出 Token/s 达到该阈值时也视为质量异常并换号重试。
+    # 这里与质量守护的 hardTPS 对齐；设为 0 可关闭这一条请求级判定。
+    maxOutputTokensPerSecond: 1000

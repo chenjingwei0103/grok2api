@@ -300,6 +300,10 @@ type QualityGuardRequestRetryConfig struct {
 	IdleAccountCooldown             Duration `yaml:"idleAccountCooldown"`
 	MinEncryptedBytes               int      `yaml:"minEncryptedBytes"`
 	EncryptedBytesPerReasoningToken int      `yaml:"encryptedBytesPerReasoningToken"`
+	// MaxOutputTokensPerSecond treats a terminal stream at or above this
+	// throughput as quality-degraded and retries it on another account.
+	// Zero disables this additional request-path guard.
+	MaxOutputTokensPerSecond float64 `yaml:"maxOutputTokensPerSecond"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -817,6 +821,9 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	if value.EncryptedBytesPerReasoningToken != 0 && (value.EncryptedBytesPerReasoningToken < 1 || value.EncryptedBytesPerReasoningToken > 16) {
 		return errors.New("qualityGuard.requestRetry.encryptedBytesPerReasoningToken 必须在 1 到 16 之间")
 	}
+	if value.MaxOutputTokensPerSecond != 0 && (value.MaxOutputTokensPerSecond < 1 || value.MaxOutputTokensPerSecond > 10000) {
+		return errors.New("qualityGuard.requestRetry.maxOutputTokensPerSecond 必须在 1 到 10000 之间，0 表示关闭")
+	}
 	return nil
 }
 
@@ -954,7 +961,7 @@ func defaultConfig() Config {
 				Enabled:     true,
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
-				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4,
+				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4, MaxOutputTokensPerSecond: 1000,
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

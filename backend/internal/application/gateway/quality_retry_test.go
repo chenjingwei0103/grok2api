@@ -59,6 +59,49 @@ func TestClassifyQualityHold(t *testing.T) {
 	}
 }
 
+func TestClassifyQualityHoldWithSpeed(t *testing.T) {
+	t.Parallel()
+	healthy := QualityStreamSignals{
+		HasThinking: true, PlaintextThinking: true, OutputTokens: 120,
+		Terminal: true, OutputTokensPerSecond: 999,
+	}
+	if got := classifyQualityHoldWithSpeed(healthy, 8, 1000); got != QualityDeliver {
+		t.Fatalf("below speed threshold verdict = %s", got)
+	}
+
+	degraded := healthy
+	degraded.OutputTokensPerSecond = 1000
+	if got := classifyQualityHoldWithSpeed(degraded, 8, 1000); got != QualityWithhold {
+		t.Fatalf("at speed threshold verdict = %s", got)
+	}
+
+	midstream := degraded
+	midstream.Terminal = false
+	if got := classifyQualityHoldWithSpeed(midstream, 8, 1000); got != QualityWait {
+		t.Fatalf("midstream speed verdict = %s, want wait for terminal evidence", got)
+	}
+
+	if got := classifyQualityHoldWithSpeed(degraded, 8, 0); got != QualityDeliver {
+		t.Fatalf("disabled speed guard verdict = %s", got)
+	}
+}
+
+func TestQualitySignalsOutputTokensPerSecondUsesAuditWindow(t *testing.T) {
+	t.Parallel()
+	started := time.Now()
+	state := qualityScanState{
+		startedAt:        started,
+		firstGeneratedAt: started.Add(100 * time.Millisecond),
+		completedAt:      started.Add(200 * time.Millisecond),
+		outputTokens:     120,
+		terminal:         true,
+	}
+	sig := state.signals()
+	if sig.OutputTokensPerSecond != 1200 {
+		t.Fatalf("output Token/s = %v, want 1200", sig.OutputTokensPerSecond)
+	}
+}
+
 func TestClassifyQualityHoldBurst(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -688,6 +731,56 @@ func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 	got, _ := io.ReadAll(replay)
 	if !strings.Contains(string(got), "answer after think") || !strings.Contains(string(got), "thinking_content") {
 		t.Fatalf("replay lost frames: %s", got)
+	}
+}
+
+func TestPeekQualityStreamHighSpeedThinkingWithholdsAtTerminal(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	done := make(chan qualityOpenPeekResult, 1)
+	go func() {
+		replay, verdict, _, _, err := peekQualityStream(
+			context.Background(), reader, qualityProtocolChat,
+			QualityRetryRuntime{
+				MinOutputTokens:          8,
+				HoldTimeout:              time.Second,
+				MaxOutputTokensPerSecond: 1000,
+			},
+		)
+		done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
+	}()
+
+	content := strings.Repeat("abcd", 40)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"choices":[{"delta":{"thinking_content":"plan"}}]}`,
+		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			defer result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityWithhold {
+			t.Fatalf("high-speed thinking verdict = %s, want withhold", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quality peek did not finish")
 	}
 }
 
