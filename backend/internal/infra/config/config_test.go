@@ -230,8 +230,8 @@ func TestDefaultQualityGuardRequestRetryContract(t *testing.T) {
 
 func TestMaxOutputTokensPerSecondEnvironmentOverride(t *testing.T) {
 	t.Setenv(MaxOutputTokensPerSecondEnv, "275.5")
-	value, err := Load("")
-	if err != nil {
+	value := defaultConfig()
+	if err := applyEnvironmentOverrides(&value); err != nil {
 		t.Fatal(err)
 	}
 	if value.QualityGuard.RequestRetry.MaxOutputTokensPerSecond != 275.5 {
@@ -243,7 +243,8 @@ func TestMaxOutputTokensPerSecondEnvironmentOverrideRejectsInvalidValue(t *testi
 	for _, raw := range []string{"not-a-number", "NaN", "+Inf"} {
 		t.Run(raw, func(t *testing.T) {
 			t.Setenv(MaxOutputTokensPerSecondEnv, raw)
-			if _, err := Load(""); err == nil {
+			value := defaultConfig()
+			if err := applyEnvironmentOverrides(&value); err == nil {
 				t.Fatalf("invalid environment threshold %q was accepted", raw)
 			}
 		})
