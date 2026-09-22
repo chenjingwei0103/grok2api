@@ -307,6 +307,18 @@ type QualityGuardRequestRetryConfig struct {
 	// throughput as quality-degraded and retries it on another account.
 	// Zero disables this additional request-path guard.
 	MaxOutputTokensPerSecond float64 `yaml:"maxOutputTokensPerSecond"`
+	// Trace persists a bounded, redacted diagnostic for every request that
+	// enters the in-process quality hold path. It is off by default because
+	// request and visible response previews can contain user content.
+	Trace QualityGuardRequestRetryTraceConfig `yaml:"trace"`
+}
+
+// QualityGuardRequestRetryTraceConfig bounds private quality diagnostics.
+// The limits apply to individual previews, not the raw request or stream.
+type QualityGuardRequestRetryTraceConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	InputMaxBytes  int  `yaml:"inputMaxBytes"`
+	OutputMaxBytes int  `yaml:"outputMaxBytes"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -834,6 +846,12 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	if value.MaxOutputTokensPerSecond != 0 && (value.MaxOutputTokensPerSecond < 1 || value.MaxOutputTokensPerSecond > 10000) {
 		return errors.New("qualityGuard.requestRetry.maxOutputTokensPerSecond 必须在 1 到 10000 之间，0 表示关闭")
 	}
+	if value.Trace.InputMaxBytes != 0 && (value.Trace.InputMaxBytes < 256 || value.Trace.InputMaxBytes > 16<<10) {
+		return errors.New("qualityGuard.requestRetry.trace.inputMaxBytes 必须在 256 到 16384 之间，0 表示默认值")
+	}
+	if value.Trace.OutputMaxBytes != 0 && (value.Trace.OutputMaxBytes < 256 || value.Trace.OutputMaxBytes > 32<<10) {
+		return errors.New("qualityGuard.requestRetry.trace.outputMaxBytes 必须在 256 到 32768 之间，0 表示默认值")
+	}
 	return nil
 }
 
@@ -972,6 +990,7 @@ func defaultConfig() Config {
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4, MaxOutputTokensPerSecond: 500,
+				Trace: QualityGuardRequestRetryTraceConfig{InputMaxBytes: 4096, OutputMaxBytes: 8192},
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

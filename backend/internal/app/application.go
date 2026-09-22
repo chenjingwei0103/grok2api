@@ -501,6 +501,11 @@ func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.Qu
 		MinEncryptedBytes:               value.MinEncryptedBytes,
 		EncryptedBytesPerReasoningToken: value.EncryptedBytesPerReasoningToken,
 		MaxOutputTokensPerSecond:        value.MaxOutputTokensPerSecond,
+		Trace: gateway.QualityTraceRuntime{
+			Enabled:        value.Trace.Enabled,
+			InputMaxBytes:  value.Trace.InputMaxBytes,
+			OutputMaxBytes: value.Trace.OutputMaxBytes,
+		},
 	}
 }
 

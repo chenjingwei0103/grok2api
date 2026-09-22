@@ -44,6 +44,9 @@ type qualityScanState struct {
 	firstGeneratedAt                time.Time
 	completedAt                     time.Time
 	firstVisibleAt                  time.Time
+	// visibleOutput is enabled only for private quality diagnostics. It holds
+	// user-visible text, never raw SSE or reasoning ciphertext.
+	visibleOutput *qualityTextCapture
 }
 
 type qualityReadResult struct {
@@ -419,6 +422,27 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 			aggregateRunes += observeQualityResponsesOutputItem(state, item)
 		}
 		state.aggregateRunes = max(state.aggregateRunes, aggregateRunes)
+		// Completed Responses payloads can contain the only copy of visible
+		// content for non-delta upstreams. Avoid duplicating it when deltas
+		// have already filled the diagnostic preview.
+		if state.visibleOutput != nil && state.visibleOutput.sourceBytes == 0 {
+			for _, item := range event.Response.Output {
+				captureResponsesVisibleOutput(state, item)
+			}
+		}
+	}
+}
+
+func captureResponsesVisibleOutput(state *qualityScanState, item qualityResponsesOutputItem) {
+	if state == nil || state.visibleOutput == nil || item.Type != "message" {
+		return
+	}
+	for _, content := range item.Content {
+		text := content.Text
+		if text == "" {
+			text = content.Refusal
+		}
+		state.visibleOutput.appendText(text)
 	}
 }
 
@@ -538,20 +562,52 @@ func noteVisibleContent(state *qualityScanState, text string) {
 		state.firstVisibleAt = time.Now()
 	}
 	state.visibleRunes += utf8.RuneCountInString(text)
+	if state.visibleOutput != nil {
+		state.visibleOutput.appendText(text)
+	}
 }
 
 func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
-	cfg = normalizeQualityRetry(cfg)
-	if body == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+	result, err := peekQualityStreamCaptured(ctx, body, protocol, cfg)
+	return result.replay, result.verdict, result.usage, result.responseID, err
+}
+
+type qualityPeekResult struct {
+	replay     io.ReadCloser
+	verdict    QualityVerdict
+	usage      Usage
+	responseID string
+	capture    qualityStreamCapture
+}
+
+func newQualityPeekResult(held *bytes.Buffer, rest io.ReadCloser, state *qualityScanState, verdict QualityVerdict) qualityPeekResult {
+	if held == nil {
+		held = &bytes.Buffer{}
 	}
-	pump := newQualityReadPump(body)
+	if state == nil {
+		state = &qualityScanState{}
+	}
+	return qualityPeekResult{
+		replay: newPrefixReplay(held, rest), verdict: verdict, usage: state.usage, responseID: state.responseID,
+		capture: newQualityStreamCapture(state.protocol, *state, held.Len(), held.Len() > qualityHoldMaxBufferBytes),
+	}
+}
+
+func peekQualityStreamCaptured(ctx context.Context, body io.ReadCloser, protocol string, cfg QualityRetryRuntime) (qualityPeekResult, error) {
+	cfg = normalizeQualityRetry(cfg)
 	state := qualityScanState{
 		protocol:                        protocol,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
 		startedAt:                       time.Now(),
 	}
+	if cfg.Trace.Enabled {
+		state.visibleOutput = newQualityTextCapture(cfg.Trace.OutputMaxBytes)
+	}
+	if body == nil {
+		return newQualityPeekResult(&bytes.Buffer{}, io.NopCloser(bytes.NewReader(nil)), &state, QualityWait), errQualityEmptyStream
+	}
+	pump := newQualityReadPump(body)
 	var held bytes.Buffer
 	holdTimer := time.NewTimer(cfg.HoldTimeout)
 	defer holdTimer.Stop()
@@ -559,32 +615,32 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		sig := state.signals()
 		if !(cfg.MaxOutputTokensPerSecond > 0 && state.terminal && !state.streamEOF) {
 			if verdict := classifyQualityHoldWithSpeed(sig, cfg.MinOutputTokens, cfg.MaxOutputTokensPerSecond); verdict != QualityWait {
-				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+				return newQualityPeekResult(&held, pump, &state, verdict), nil
 			}
 		}
 		// A completed empty stream must rotate immediately. Waiting for idle
 		// timeout after response.completed / [DONE] surfaces HTTP 200 with 0
 		// tokens and makes Grok TUI retry for 50–120s.
 		if sig.Terminal && (cfg.MaxOutputTokensPerSecond <= 0 || state.streamEOF) {
-			return finishQualityPeek(&held, pump, &state, cfg)
+			return finishQualityPeekCaptured(&held, pump, &state, cfg)
 		}
 
 		select {
 		case <-ctx.Done():
 			_ = pump.Close()
-			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
+			return newQualityPeekResult(&held, io.NopCloser(bytes.NewReader(nil)), &state, QualityWait), qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
 			state.holdExpired = true
 			sig.HoldExpired = true
 			if !(cfg.MaxOutputTokensPerSecond > 0 && state.terminal && !state.streamEOF) {
 				if verdict := classifyQualityHoldWithSpeed(sig, cfg.MinOutputTokens, cfg.MaxOutputTokensPerSecond); verdict != QualityWait {
-					return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+					return newQualityPeekResult(&held, pump, &state, verdict), nil
 				}
 			}
 		case result, ok := <-pump.results:
 			if !ok {
 				state.streamEOF = true
-				return finishQualityPeek(&held, pump, &state, cfg)
+				return finishQualityPeekCaptured(&held, pump, &state, cfg)
 			}
 			if len(result.data) > 0 {
 				if held.Len()+len(result.data) > qualityHoldMaxBufferBytes {
@@ -595,26 +651,26 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 					if verdict == QualityWait {
 						verdict = QualityWithhold
 					}
-					return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
+					return newQualityPeekResult(&held, pump, &state, verdict), nil
 				}
 				_, _ = held.Write(result.data)
 				ObserveQualityChunk(&state, result.data)
 			}
 			if result.err == io.EOF {
 				state.streamEOF = true
-				return finishQualityPeek(&held, pump, &state, cfg)
+				return finishQualityPeekCaptured(&held, pump, &state, cfg)
 			}
 			if result.err != nil {
 				_ = pump.Close()
-				return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, result.err)
+				return newQualityPeekResult(&held, io.NopCloser(bytes.NewReader(nil)), &state, QualityWait), qualityPeekAbortError(ctx, result.err)
 			}
 		}
 	}
 }
 
-func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (io.ReadCloser, QualityVerdict, Usage, string, error) {
+func finishQualityPeekCaptured(held *bytes.Buffer, pump *qualityReadPump, state *qualityScanState, cfg QualityRetryRuntime) (qualityPeekResult, error) {
 	if state == nil {
-		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
+		return newQualityPeekResult(held, pump, nil, QualityWait), errQualityEmptyStream
 	}
 	if len(state.pending) > 0 {
 		// Process a final valid SSE data line even when the upstream omitted its
@@ -625,11 +681,11 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 	signals := state.signals()
 	if !signals.HasThinking && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
 		if state.semanticOutput {
-			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.responseID, nil
+			return newQualityPeekResult(held, pump, state, QualityDeliver), nil
 		}
-		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
+		return newQualityPeekResult(held, pump, state, QualityWait), errQualityEmptyStream
 	}
-	return newPrefixReplay(held, pump), classifyQualityHoldWithSpeed(signals, cfg.MinOutputTokens, cfg.MaxOutputTokensPerSecond), state.usage, state.responseID, nil
+	return newQualityPeekResult(held, pump, state, classifyQualityHoldWithSpeed(signals, cfg.MinOutputTokens, cfg.MaxOutputTokensPerSecond)), nil
 }
 
 func newPrefixReplay(held *bytes.Buffer, rest io.ReadCloser) io.ReadCloser {

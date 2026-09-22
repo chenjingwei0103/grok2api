@@ -23,6 +23,8 @@ const (
 	defaultQualityMaxAttempts              = 6
 	defaultQualityHoldTimeout              = 30 * time.Second
 	defaultQualityMinOutput                = int64(8)
+	defaultQualityTraceInputBytes          = 4096
+	defaultQualityTraceOutputBytes         = 8192
 	defaultMinEncryptedBytes               = 256
 	defaultEncryptedBytesPerReasoningToken = 4
 	defaultBurstFlushMS                    = int64(1000)
@@ -68,6 +70,18 @@ type QualityRetryRuntime struct {
 	// throughput at or above this value as degraded. Zero disables this
 	// additional request-path guard.
 	MaxOutputTokensPerSecond float64
+	// Trace writes bounded, redacted diagnostics for both delivered and
+	// withheld streams that enter this quality hold path.
+	Trace QualityTraceRuntime
+}
+
+// QualityTraceRuntime controls private per-attempt diagnostics. It is kept
+// inside the request retry runtime so settings hot reloads update it together
+// with the classifier thresholds.
+type QualityTraceRuntime struct {
+	Enabled        bool
+	InputMaxBytes  int
+	OutputMaxBytes int
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this
@@ -132,6 +146,12 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 	}
 	if cfg.EncryptedBytesPerReasoningToken <= 0 {
 		cfg.EncryptedBytesPerReasoningToken = defaultEncryptedBytesPerReasoningToken
+	}
+	if cfg.Trace.InputMaxBytes <= 0 {
+		cfg.Trace.InputMaxBytes = defaultQualityTraceInputBytes
+	}
+	if cfg.Trace.OutputMaxBytes <= 0 {
+		cfg.Trace.OutputMaxBytes = defaultQualityTraceOutputBytes
 	}
 	cfg.OnExhausted = normalizeQualityExhaustionPolicy(cfg.OnExhausted)
 	return cfg

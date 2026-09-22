@@ -188,6 +188,37 @@ func (r *failureAttemptRecorder) captureQualityDegraded(credential accountdomain
 	})
 }
 
+// captureQualityTrace writes a bounded private diagnostic for one upstream
+// candidate. It is used for both normal deliveries and quality holds so an
+// audit detail can compare the same request across account switches.
+func (r *failureAttemptRecorder) captureQualityTrace(credential accountdomain.Credential, startedAt time.Time, value qualityTraceAttemptInput) *audit.Attempt {
+	if !value.Retry.Trace.Enabled {
+		return nil
+	}
+	payload, payloadTruncated := marshalQualityTraceEnvelope(newQualityTraceEnvelope(value, credential))
+	body, bodyTruncated := r.captureBody(payload, payloadTruncated)
+	status := http.StatusOK
+	attempt := audit.Attempt{
+		Source:                audit.AttemptSourceUpstreamHTTP,
+		Stage:                 "quality_trace",
+		AccountID:             auditAccountID(credential.ID),
+		AccountName:           credential.Name,
+		Method:                r.method,
+		RequestPath:           r.path,
+		UpstreamURL:           sanitizeUpstreamURL(value.UpstreamURL),
+		StartedAt:             startedAt.UTC(),
+		DurationMS:            time.Since(startedAt).Milliseconds(),
+		UpstreamStatusCode:    &status,
+		UpstreamStatus:        "200 OK",
+		ResponseBody:          body,
+		ResponseBodyTruncated: bodyTruncated,
+		TransportError:        value.qualityError(),
+	}
+	r.append(attempt)
+	copy := r.attempts[len(r.attempts)-1]
+	return &copy
+}
+
 func (r *failureAttemptRecorder) append(attempt audit.Attempt) {
 	attempt.Number = len(r.attempts) + 1
 	r.attempts = append(r.attempts, attempt)

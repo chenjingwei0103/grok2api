@@ -1023,6 +1023,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// nor new evidence and can multiply a slow/failing probe.
 	holdCfg := s.qualityRetryConfig()
 	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	var qualityRequestTrace qualityTraceRequest
+	if qualityHoldEnabled && holdCfg.Trace.Enabled {
+		qualityRequestTrace = newQualityTraceRequest(input.Body, holdCfg.Trace.InputMaxBytes)
+	}
+	qualityClientSource := qualityTraceClientSource(input.Headers)
 	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), input.ForcedAccountID != 0 || (ownership != nil && !qualityHoldEnabled))
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
@@ -1065,11 +1070,17 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
-	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time) *Result {
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, traceReader *qualityTraceReadCloser) *Result {
 		accountID := credential.ID
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
 			once.Do(func() {
+				// The HTTP handler finalizes before its deferred Body.Close. Finish
+				// the quality reader here so a healthy stream's diagnostic enters
+				// the same audit record before attempts are snapshotted.
+				if traceReader != nil {
+					traceReader.finish()
+				}
 				// HTTP 状态码保留线上真实值；流在 2xx 响应头之后失败时由 errorCode
 				// 决定最终结果，避免把协议状态与业务结果混为一谈。
 				successful := auditRequestSucceeded(response.StatusCode, errorCode)
@@ -1212,6 +1223,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		credential        accountdomain.Credential
 		usage             Usage
 		upstreamStartedAt time.Time
+		trace             *qualityTraceAttemptInput
 	}
 	var fallback *qualityFallback
 	discardFallback := func(recordDegraded bool) {
@@ -1219,11 +1231,32 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			return
 		}
 		if recordDegraded {
+			if fallback.trace != nil {
+				failureAttempts.captureQualityTrace(fallback.credential, fallback.upstreamStartedAt, *fallback.trace)
+			} else {
+				failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
+			}
 			s.recordQualityDegraded(ctx, auditBase, fallback.credential, fallback.usage, startedAt, egressTrace, route.Provider)
-			failureAttempts.captureQualityDegraded(fallback.credential, fallback.upstreamStartedAt)
 		}
 		_ = fallback.response.Body.Close()
 		fallback = nil
+	}
+	handoffFallback := func() *Result {
+		selected := fallback
+		fallback = nil
+		if selected == nil {
+			return nil
+		}
+		var fallbackTrace *qualityTraceReadCloser
+		if selected.trace != nil {
+			fallbackInput := *selected.trace
+			fallbackInput.Action = string(QualityActionDeliverLast)
+			fallbackTrace = newQualityTraceReadCloser(selected.response.Body, fallbackInput.Capture, func(capture qualityStreamCapture) {
+				failureAttempts.captureQualityTrace(selected.credential, selected.upstreamStartedAt, fallbackInput.withCapture(capture))
+			})
+			selected.response.Body = fallbackTrace
+		}
+		return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, fallbackTrace)
 	}
 attemptLoop:
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
@@ -1587,10 +1620,19 @@ attemptLoop:
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				replay, verdict, peekUsage, _, peekErr := peekQualityStream(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				peek, peekErr := peekQualityStreamCaptured(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
 				if peekErr != nil {
-					if replay != nil {
-						_ = replay.Close()
+					if holdCfg.Trace.Enabled {
+						failureAttempts.captureQualityTrace(credential, responseStartedAt, qualityTraceAttemptInput{
+							Request: qualityRequestTrace, RequestID: input.RequestID, RequestPath: path,
+							PublicModel: input.PublicModel, UpstreamModel: route.UpstreamModel, Provider: string(route.Provider), Operation: operation,
+							ReasoningEffort: auditBase.ReasoningEffort, ClientSource: qualityClientSource, QualityAttempt: qualityAccountAttempts,
+							Verdict: peek.verdict, Action: "peek_error", Retry: holdCfg, Capture: peek.capture,
+							Egress: snapshotQualityTraceEgress(credential, egressTrace, route.Provider), UpstreamURL: response.UpstreamURL,
+						})
+					}
+					if peek.replay != nil {
+						_ = peek.replay.Close()
 					} else {
 						_ = response.Body.Close()
 					}
@@ -1619,21 +1661,28 @@ attemptLoop:
 					}
 					continue
 				}
-				response.Body = replay
+				response.Body = peek.replay
 				hasNextAccount := attemptPolicy.hasNext(attempt) && qualityAccountAttempts < holdCfg.MaxAttempts
 				if selection != nil {
 					hasNextAccount = hasNextAccount && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
 				} else if ownership == nil {
 					hasNextAccount = false
 				}
-				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
-				if verdict == QualityWithhold {
+				commit := CommitQualityHold(peek.verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+				traceInput := qualityTraceAttemptInput{
+					Request: qualityRequestTrace, RequestID: input.RequestID, RequestPath: path,
+					PublicModel: input.PublicModel, UpstreamModel: route.UpstreamModel, Provider: string(route.Provider), Operation: operation,
+					ReasoningEffort: auditBase.ReasoningEffort, ClientSource: qualityClientSource, QualityAttempt: qualityAccountAttempts,
+					Verdict: peek.verdict, Action: string(commit.Action), Retry: holdCfg, Capture: peek.capture,
+					Egress: snapshotQualityTraceEgress(credential, egressTrace, route.Provider), UpstreamURL: response.UpstreamURL,
+				}
+				if peek.verdict == QualityWithhold {
 					cooldown := holdCfg.AccountCooldown
 					// Usage not reported yet (logged as output_tokens=0) is the
 					// empty/short-hold path, not a confirmed 128k missing-thinking
 					// dump. Use idle cooldown so one TUI turn does not 1.5h-burn
 					// five accounts.
-					if peekUsage.OutputTokens == 0 && peekUsage.ReasoningTokens == 0 {
+					if peek.usage.OutputTokens == 0 && peek.usage.ReasoningTokens == 0 {
 						cooldown = holdCfg.IdleAccountCooldown
 						if cooldown <= 0 {
 							cooldown = qualityIdleAccountCooldown
@@ -1643,14 +1692,20 @@ attemptLoop:
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
-					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
-					failureAttempts.captureQualityDegraded(credential, responseStartedAt)
+					if holdCfg.Trace.Enabled {
+						failureAttempts.captureQualityTrace(credential, responseStartedAt, traceInput)
+					} else {
+						failureAttempts.captureQualityDegraded(credential, responseStartedAt)
+					}
+					s.recordQualityDegraded(ctx, auditBase, credential, peek.usage, startedAt, egressTrace, route.Provider)
 				}
+				var traceReader *qualityTraceReadCloser
 				switch commit.Action {
 				case QualityActionRetry:
 					if deferFailOpenAudit {
 						discardFallback(true)
-						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peekUsage, upstreamStartedAt: responseStartedAt}
+						traceCopy := traceInput
+						fallback = &qualityFallback{response: response, lease: lease, credential: credential, usage: peek.usage, upstreamStartedAt: responseStartedAt, trace: &traceCopy}
 						lease.completeSelectorObservation(true)
 						lease.Release()
 					} else {
@@ -1663,7 +1718,7 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "output_tokens_per_second", peekUsage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
+					s.logger.Info("quality_degraded_retry", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peek.usage.OutputTokens, "output_tokens_per_second", peek.usage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
 					continue
 				case QualityActionReject:
 					_ = response.Body.Close()
@@ -1674,11 +1729,11 @@ attemptLoop:
 						PublicMessage: "上游响应缺少推理", AccountID: credential.ID, AccountName: credential.Name,
 						Cause: errQualityDegraded,
 					}
-					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID, "output_tokens_per_second", peekUsage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
+					s.logger.Info("quality_degraded_rejected", "request_id", input.RequestID, "account_id", credential.ID, "output_tokens_per_second", peek.usage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
 					break attemptLoop
 				case QualityActionDeliverLast:
 					discardFallback(true)
-					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peekUsage.OutputTokens, "output_tokens_per_second", peekUsage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
+					s.logger.Info("quality_degraded_deliver_last", "request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts, "output_tokens", peek.usage.OutputTokens, "output_tokens_per_second", peek.usage.OutputTokensPerSecond, "speed_threshold", holdCfg.MaxOutputTokensPerSecond)
 				case QualityActionDeliver:
 					discardFallback(true)
 				}
@@ -1687,6 +1742,22 @@ attemptLoop:
 					lease.Release()
 					break attemptLoop
 				}
+				if holdCfg.Trace.Enabled {
+					traceReader = newQualityTraceReadCloser(response.Body, peek.capture, func(capture qualityStreamCapture) {
+						failureAttempts.captureQualityTrace(credential, responseStartedAt, traceInput.withCapture(capture))
+					})
+					response.Body = traceReader
+				}
+				if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
+					recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
+					if recoveredFailure.AccountBlocked || (credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(recoveredFailure)) {
+						reason := fmt.Sprintf("%s primary endpoint denied account access", credential.Provider)
+						if !s.markReauthRequired(ctx, input.RequestID, credential, reason) {
+							s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, 0)
+						}
+					}
+				}
+				return handoffResponse(response, lease, credential, responseStartedAt, traceReader), nil
 			}
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
@@ -1702,19 +1773,15 @@ attemptLoop:
 			_ = response.Body.Close()
 			lease.completeSelectorObservation(false)
 			lease.Release()
-			selected := fallback
-			fallback = nil
-			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", fallback.credential.ID, "quality_attempts", qualityAccountAttempts)
+			return handoffFallback(), nil
 		}
-		return handoffResponse(response, lease, credential, responseStartedAt), nil
+		return handoffResponse(response, lease, credential, responseStartedAt, nil), nil
 	}
 	if fallback != nil {
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {
-			selected := fallback
-			fallback = nil
-			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", selected.credential.ID, "quality_attempts", qualityAccountAttempts)
-			return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt), nil
+			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", fallback.credential.ID, "quality_attempts", qualityAccountAttempts)
+			return handoffFallback(), nil
 		}
 		discardFallback(true)
 	}
