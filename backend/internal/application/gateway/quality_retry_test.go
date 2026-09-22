@@ -59,6 +59,62 @@ func TestClassifyQualityHold(t *testing.T) {
 	}
 }
 
+func TestClassifyQualityHoldWithSpeed(t *testing.T) {
+	t.Parallel()
+	healthy := QualityStreamSignals{
+		HasThinking: true, PlaintextThinking: true, OutputTokens: 120,
+		Terminal: true, OutputTokensPerSecond: 999,
+	}
+	if got := classifyQualityHoldWithSpeed(healthy, 8, 1000); got != QualityDeliver {
+		t.Fatalf("below speed threshold verdict = %s", got)
+	}
+
+	degraded := healthy
+	degraded.OutputTokensPerSecond = 1000.01
+	if got := classifyQualityHoldWithSpeed(degraded, 8, 1000); got != QualityWithhold {
+		t.Fatalf("above speed threshold verdict = %s", got)
+	}
+
+	short := degraded
+	short.OutputTokens = 1
+	short.VisibleTokens = 1
+	if got := classifyQualityHoldWithSpeed(short, 8, 1000); got != QualityWithhold {
+		t.Fatalf("short output above speed threshold verdict = %s", got)
+	}
+
+	midstream := degraded
+	midstream.Terminal = false
+	if got := classifyQualityHoldWithSpeed(midstream, 8, 1000); got != QualityWait {
+		t.Fatalf("midstream speed verdict = %s, want wait for terminal evidence", got)
+	}
+
+	encryptedMidstream := midstream
+	encryptedMidstream.PlaintextThinking = false
+	if got := classifyQualityHoldWithSpeed(encryptedMidstream, 8, 1000); got != QualityWait {
+		t.Fatalf("encrypted midstream speed verdict = %s, want wait for terminal evidence", got)
+	}
+
+	if got := classifyQualityHoldWithSpeed(degraded, 8, 0); got != QualityDeliver {
+		t.Fatalf("disabled speed guard verdict = %s", got)
+	}
+}
+
+func TestQualitySignalsOutputTokensPerSecondUsesAuditWindow(t *testing.T) {
+	t.Parallel()
+	started := time.Now()
+	state := qualityScanState{
+		startedAt:        started,
+		firstGeneratedAt: started.Add(100 * time.Millisecond),
+		completedAt:      started.Add(200 * time.Millisecond),
+		outputTokens:     120,
+		terminal:         true,
+	}
+	sig := state.signals()
+	if sig.OutputTokensPerSecond != 1200 {
+		t.Fatalf("output Token/s = %v, want 1200", sig.OutputTokensPerSecond)
+	}
+}
+
 func TestClassifyQualityHoldBurst(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -691,6 +747,117 @@ func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 	}
 }
 
+func TestPeekQualityStreamHighSpeedThinkingWithholdsAtTerminal(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	done := make(chan qualityOpenPeekResult, 1)
+	go func() {
+		replay, verdict, _, _, err := peekQualityStream(
+			context.Background(), reader, qualityProtocolChat,
+			QualityRetryRuntime{
+				MinOutputTokens:          8,
+				HoldTimeout:              time.Second,
+				MaxOutputTokensPerSecond: 1000,
+			},
+		)
+		done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
+	}()
+
+	content := strings.Repeat("abcd", 40)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"choices":[{"delta":{"thinking_content":"plan"}}]}`,
+		`data: {"choices":[{"delta":{"content":"`+content+`"}}]}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			defer result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityWithhold {
+			t.Fatalf("high-speed thinking verdict = %s, want withhold", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quality peek did not finish")
+	}
+}
+
+func TestPeekQualityStreamHighSpeedEncryptedThinkingWaitsForTerminal(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	done := make(chan qualityOpenPeekResult, 1)
+	go func() {
+		replay, verdict, _, _, err := peekQualityStream(
+			context.Background(), reader, qualityProtocolResponses,
+			QualityRetryRuntime{
+				MinOutputTokens:          8,
+				HoldTimeout:              time.Second,
+				MaxOutputTokensPerSecond: 1000,
+			},
+		)
+		done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
+	}()
+
+	cipher := strings.Repeat("A", defaultMinEncryptedBytes)
+	content := strings.Repeat("abcd", 40)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"`+cipher+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"`+content+`"}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			_ = result.replay.Close()
+		}
+		t.Fatalf("encrypted thinking stream released before terminal: verdict=%s err=%v", result.verdict, result.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.completed","response":{"id":"resp_1","usage":{"output_tokens":80,"output_tokens_details":{"reasoning_tokens":40}}}}`,
+		"data: [DONE]",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			defer result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityWithhold {
+			t.Fatalf("high-speed encrypted thinking verdict = %s, want withhold", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quality peek did not finish")
+	}
+}
+
 func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 	t.Parallel()
 	content := strings.Repeat("abcd", 16) // 64 runes → 16 tokens... need 32 tokens = 128 runes
@@ -1172,6 +1339,11 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	input := Input{Streaming: true, PublicModel: "grok-4.6"}
 	if !shouldHoldQualityStream(input, nil, route, audit.OperationChat, cfg) {
 		t.Fatal("expected hold on thinking build chat")
+	}
+	grok47Route := modeldomain.Route{Provider: accountdomain.ProviderBuild, UpstreamModel: "grok-4.7", PublicID: "grok-4.7"}
+	grok47Input := Input{Streaming: true, PublicModel: "grok-4.7"}
+	if !shouldHoldQualityStream(grok47Input, nil, grok47Route, audit.OperationResponses, cfg) {
+		t.Fatal("expected hold on grok-4.7 Build responses")
 	}
 	off := cfg
 	off.Enabled = false

@@ -431,9 +431,12 @@ qualityGuard:
     onExhausted: fail_closed # fail_open | fail_closed
     accountCooldown: 12h
     idleAccountCooldown: 15m
+    # 终止流输出 Token/s 达到该值时也扣住并换号；0 表示关闭。
+    # 可用环境变量 GROK2API_MAX_OUTPUT_TOKENS_PER_SECOND 覆盖。
+    maxOutputTokensPerSecond: 500
 ```
 
-`requestRetry` 在网关请求路径上生效，与 sidecar 探测/隔离相互独立。本 fork 默认开启。可见输出达到 `minOutputTokens` 且全程无流式 reasoning 时**不发给用户**，排除该账号再试。TUI 续聊（`previous_response_id`）和 hosted tools 仍 hold：第一枪钉原账号，扣住后 unpin 换号。不处理图/视频和 ForcedEgress 探针。全部仍无推理则按 `onExhausted` 返回 `503 quality_degraded` 或放出最后一枪。
+`requestRetry` 在网关请求路径上生效，与 sidecar 探测/隔离相互独立。本 fork 默认开启。可见输出达到 `minOutputTokens` 且全程无流式 reasoning 时**不发给用户**，排除该账号再试；终止流的审计输出 Token/s 达到 `maxOutputTokensPerSecond` 时也按质量异常处理并换号。阈值来自 `qualityGuard.requestRetry.maxOutputTokensPerSecond`，也可用环境变量 `GROK2API_MAX_OUTPUT_TOKENS_PER_SECOND` 覆盖，`0` 表示关闭速度判定。TUI 续聊（`previous_response_id`）和 hosted tools 仍 hold：第一枪钉原账号，扣住后 unpin 换号。不处理图/视频和 ForcedEgress 探针。全部仍无推理或速度异常则按 `onExhausted` 返回 `503 quality_degraded` 或放出最后一枪。
 
 ```bash
 docker compose up -d

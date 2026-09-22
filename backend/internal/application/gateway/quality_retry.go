@@ -46,7 +46,7 @@ const (
 )
 
 var (
-	errQualityDegraded    = errors.New("上游响应缺少推理")
+	errQualityDegraded    = errors.New("上游响应质量异常")
 	errQualityEmptyStream = errors.New("上游流式响应为空")
 )
 
@@ -64,6 +64,10 @@ type QualityRetryRuntime struct {
 	IdleAccountCooldown             time.Duration
 	MinEncryptedBytes               int
 	EncryptedBytesPerReasoningToken int
+	// MaxOutputTokensPerSecond treats a terminal stream with an output
+	// throughput at or above this value as degraded. Zero disables this
+	// additional request-path guard.
+	MaxOutputTokensPerSecond float64
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this
@@ -76,15 +80,16 @@ type QualityStreamSignals struct {
 	// ReasoningStarted is an empty reasoning item or the Chat SSE stub
 	// `: grok2api-reasoning-start`. That is not proof of thinking: 降智
 	// still emits the stub, then dumps visible tokens with usage 0.
-	ReasoningStarted bool
-	VisibleTokens    int64
-	ReasoningTokens  int64
-	OutputTokens     int64
-	EncryptedBytes   int
-	FirstVisible     bool
-	VisibleFlushMS   int64
-	Terminal         bool
-	HoldExpired      bool
+	ReasoningStarted      bool
+	VisibleTokens         int64
+	ReasoningTokens       int64
+	OutputTokens          int64
+	EncryptedBytes        int
+	FirstVisible          bool
+	VisibleFlushMS        int64
+	Terminal              bool
+	HoldExpired           bool
+	OutputTokensPerSecond float64
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -261,6 +266,12 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
+	// Trust the final upstream usage counter for this temporary comparison.
+	// The speed guard runs before this classifier, so a terminal response above
+	// MaxOutputTokensPerSecond is still withheld and retried.
+	if sig.Terminal && sig.ReasoningTokens > 0 {
+		return QualityDeliver
+	}
 	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
 		return QualityWithhold
 	}
@@ -314,6 +325,28 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 		return QualityDeliver
 	}
 	return QualityWait
+}
+
+// classifyQualityHoldWithSpeed extends the missing-thinking classifier with
+// the same output Token/s metric used by the audit panel and egress guard.
+// Speed is evaluated only after the upstream stream reaches a terminal event;
+// this avoids retrying a healthy stream merely because one network read
+// delivered a buffered chunk quickly. The threshold is independent of output
+// length: even a one-token terminal response is retried when it exceeds it.
+func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, maxOutputTokensPerSecond float64) QualityVerdict {
+	if maxOutputTokensPerSecond > 0 && sig.Terminal {
+		if sig.OutputTokensPerSecond > maxOutputTokensPerSecond {
+			return QualityWithhold
+		}
+	}
+	if maxOutputTokensPerSecond > 0 && !sig.Terminal && sig.HasThinking {
+		// The final usage frame is needed to measure the same output Token/s
+		// value shown by the audit panel. This applies to plaintext and
+		// encrypted thinking alike; releasing encrypted thinking early bypasses
+		// the speed guard before the terminal event supplies its denominator.
+		return QualityWait
+	}
+	return ClassifyQualityHold(sig, minOutput)
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain

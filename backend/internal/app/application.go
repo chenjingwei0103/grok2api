@@ -500,6 +500,7 @@ func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.Qu
 		IdleAccountCooldown:             value.IdleAccountCooldown.Value(),
 		MinEncryptedBytes:               value.MinEncryptedBytes,
 		EncryptedBytesPerReasoningToken: value.EncryptedBytesPerReasoningToken,
+		MaxOutputTokensPerSecond:        value.MaxOutputTokensPerSecond,
 	}
 }
 

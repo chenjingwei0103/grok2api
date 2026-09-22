@@ -20,6 +20,9 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 		{model: "grok-4.6", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "Build/grok-4.6", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "Console/grok-4.6", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "grok-4.7", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "Build/grok-4.7", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "Console/grok-4.7", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "grok-build-0.1", want: []string{"none"}},
 		{model: GrokComposer25Fast, want: []string{"none"}},
 		{model: "unknown-model", want: []string{"none"}},
@@ -50,6 +53,12 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 	}
 	if SupportsReasoningEffort("grok-4.6", "none") || SupportsReasoningEffort("grok-4.6", "max") {
 		t.Fatal("grok-4.6 must not advertise none/max")
+	}
+	if !SupportsReasoningForProvider(account.ProviderBuild, "grok-4.7") {
+		t.Fatal("grok-4.7 must participate in Build quality checks")
+	}
+	if !SupportsReasoningEffort("grok-4.7", "xhigh") || !SupportsReasoningEffortForProvider(account.ProviderConsole, "grok-4.7", "xhigh") {
+		t.Fatal("grok-4.7 must preserve grok-4.6 reasoning effort coverage")
 	}
 	if SupportsReasoningEffortForProvider(account.ProviderConsole, "grok-4.20-0309-reasoning", "low") ||
 		!SupportsReasoningEffortForProvider(account.ProviderBuild, "grok-4.20-0309-reasoning", "low") {
