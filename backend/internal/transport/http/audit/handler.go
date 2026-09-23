@@ -124,6 +124,7 @@ type auditResponse struct {
 	ContextOutputTokens     int64                     `json:"contextOutputTokens"`
 	FirstTokenMS            *int64                    `json:"firstTokenMs,omitempty"`
 	OutputTokensPerSecond   *float64                  `json:"outputTokensPerSecond,omitempty"`
+	UpstreamOutputTPS       *float64                  `json:"upstreamOutputTokensPerSecond,omitempty"`
 	DurationMS              int64                     `json:"durationMs"`
 	ErrorCode               string                    `json:"errorCode,omitempty"`
 	RequestMethod           string                    `json:"requestMethod,omitempty"`
@@ -493,7 +494,8 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 		Billing:        newBillingBreakdown(value),
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens,
-		FirstTokenMS: value.FirstTokenMS, OutputTokensPerSecond: auditOutputTokensPerSecond(value), DurationMS: value.DurationMS,
+		FirstTokenMS: value.FirstTokenMS, OutputTokensPerSecond: auditOutputTokensPerSecond(value),
+		UpstreamOutputTPS: value.UpstreamOutputTPS, DurationMS: value.DurationMS,
 		ErrorCode: value.ErrorCode, RequestMethod: value.RequestMethod, RequestPath: value.RequestPath, RequestHeaders: value.RequestHeaders,
 		AttemptCount: value.AttemptCount,
 		CreatedAt:    value.CreatedAt,

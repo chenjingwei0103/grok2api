@@ -347,14 +347,17 @@ function ResponsePerformance({ audit, locale }: { audit: AuditDTO; locale: strin
   const duration = splitDuration(formatDuration(audit.durationMs));
   const firstToken = audit.firstTokenMs === undefined ? { value: "—", unit: "" } : splitDuration(formatDuration(audit.firstTokenMs));
   const throughput = audit.outputTokensPerSecond === undefined ? "—" : formatNumber(audit.outputTokensPerSecond, locale, 1);
+  const upstreamThroughput = audit.upstreamOutputTokensPerSecond === undefined ? "—" : formatNumber(audit.upstreamOutputTokensPerSecond, locale, 1);
   return (
     <div className="grid w-fit max-w-full grid-cols-[auto_auto] gap-x-2.5 gap-y-0.5 whitespace-nowrap text-[11px] leading-4 tabular-nums">
       <span className="text-muted-foreground">{t("audits.durationMetric")}</span>
       <PerformanceValue value={duration.value} unit={duration.unit} />
       <span className="text-muted-foreground">{t("audits.firstTokenMetric")}</span>
       <PerformanceValue value={firstToken.value} unit={firstToken.unit} />
-      <span className="text-muted-foreground">{t("audits.throughputMetric")}</span>
+      <span className="text-muted-foreground">{t("audits.requestEstimateMetric")}</span>
       <PerformanceValue value={throughput} unit={t("audits.tokensPerSecondUnit")} />
+      <span className="text-muted-foreground">{t("audits.upstreamGenerationMetric")}</span>
+      <PerformanceValue value={upstreamThroughput} unit={t("audits.tokensPerSecondUnit")} />
     </div>
   );
 }

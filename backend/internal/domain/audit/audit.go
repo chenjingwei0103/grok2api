@@ -109,6 +109,7 @@ type Record struct {
 	ContextInputTokens      int64
 	ContextOutputTokens     int64
 	FirstTokenMS            *int64
+	UpstreamOutputTPS       *float64
 	DurationMS              int64
 	ErrorCode               string
 	RequestMethod           string

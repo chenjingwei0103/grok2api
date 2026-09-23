@@ -1070,7 +1070,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
-	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, traceReader *qualityTraceReadCloser) *Result {
+	handoffResponse := func(response *provider.Response, lease *accountLease, credential accountdomain.Credential, upstreamStartedAt time.Time, traceReader *qualityTraceReadCloser, upstreamOutputTokensPerSecond float64) *Result {
 		accountID := credential.ID
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
@@ -1127,6 +1127,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				record.NumServerSideToolsUsed = usage.NumServerSideToolsUsed
 				record.ContextInputTokens = usage.ContextInputTokens
 				record.ContextOutputTokens = usage.ContextOutputTokens
+				if upstreamOutputTokensPerSecond > 0 {
+					record.UpstreamOutputTPS = &upstreamOutputTokensPerSecond
+				}
 				if successful && input.Streaming {
 					record.FirstTokenMS = firstToken.milliseconds()
 				}
@@ -1256,7 +1259,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			})
 			selected.response.Body = fallbackTrace
 		}
-		return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, fallbackTrace)
+		return handoffResponse(selected.response, selected.lease, selected.credential, selected.upstreamStartedAt, fallbackTrace, selected.usage.OutputTokensPerSecond)
 	}
 attemptLoop:
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
@@ -1757,7 +1760,7 @@ attemptLoop:
 						}
 					}
 				}
-				return handoffResponse(response, lease, credential, responseStartedAt, traceReader), nil
+				return handoffResponse(response, lease, credential, responseStartedAt, traceReader, peek.usage.OutputTokensPerSecond), nil
 			}
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
@@ -1776,7 +1779,7 @@ attemptLoop:
 			s.logger.Info("quality_degraded_fallback", "request_id", input.RequestID, "account_id", fallback.credential.ID, "quality_attempts", qualityAccountAttempts)
 			return handoffFallback(), nil
 		}
-		return handoffResponse(response, lease, credential, responseStartedAt, nil), nil
+		return handoffResponse(response, lease, credential, responseStartedAt, nil, 0), nil
 	}
 	if fallback != nil {
 		if ctx.Err() == nil && holdCfg.OnExhausted == qualityRetryFailOpen {

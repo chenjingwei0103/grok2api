@@ -106,6 +106,30 @@ func TestAuditResponseDerivesOutputThroughput(t *testing.T) {
 	}
 }
 
+func TestAuditResponseIncludesUpstreamOutputTokensPerSecond(t *testing.T) {
+	const expected = 43.25
+	value := expected
+	encoded, err := json.Marshal(newAuditResponse(auditdomain.Record{UpstreamOutputTPS: &value}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := payload["upstreamOutputTokensPerSecond"]
+	if !ok {
+		t.Fatalf("upstreamOutputTokensPerSecond missing from response: %s", encoded)
+	}
+	var got float64
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != expected {
+		t.Fatalf("upstream output TPS = %v, want %v", got, expected)
+	}
+}
+
 func TestQualityGuardAuditListMarksOwnProbeWithoutExposingKeyIdentity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()

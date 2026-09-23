@@ -64,6 +64,7 @@ export type AuditDTO = {
   contextOutputTokens: number;
   firstTokenMs?: number;
   outputTokensPerSecond?: number;
+  upstreamOutputTokensPerSecond?: number;
   durationMs: number;
   errorCode?: string;
   requestMethod?: string;
@@ -156,7 +157,7 @@ const auditValidator = hasShape({
   cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, totalTokens: isNumber,
   costInUsdTicks: isNumber, estimatedCostInUsdTicks: isNumber, pricingModel: isOptional(isString), pricingVersion: isOptional(isString), billing: isOptional(auditBillingValidator),
   numSourcesUsed: isNumber, numServerSideToolsUsed: isNumber, contextInputTokens: isNumber, contextOutputTokens: isNumber,
-  firstTokenMs: isOptional(isNumber), outputTokensPerSecond: isOptional(isNumber),
+  firstTokenMs: isOptional(isNumber), outputTokensPerSecond: isOptional(isNumber), upstreamOutputTokensPerSecond: isOptional(isNumber),
   durationMs: isNumber, errorCode: isOptional(isString), requestMethod: isOptional(isString), requestPath: isOptional(isString),
   requestHeaders: isOptional(isRecordOf(isArrayOf(isString))), attemptCount: isNumber, createdAt: isString,
 });

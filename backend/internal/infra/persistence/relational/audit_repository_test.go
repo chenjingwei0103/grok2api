@@ -13,6 +13,36 @@ import (
 	repositorypkg "github.com/chenyme/grok2api/backend/internal/repository"
 )
 
+func TestAuditRepositoryRoundTripsUpstreamOutputTokensPerSecond(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-upstream-tps.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	const expected = 43.25
+	record := audit.Record{RequestID: "upstream-tps", ClientKeyID: 1, ModelRouteID: 1, StatusCode: http.StatusOK, CreatedAt: time.Now().UTC()}
+	value := expected
+	record.UpstreamOutputTPS = &value
+	if err := NewAuditRepository(database).Create(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := NewAuditRepository(database).Get(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.UpstreamOutputTPS == nil {
+		t.Fatal("stored upstream generation TPS is nil")
+	}
+	if got := *stored.UpstreamOutputTPS; got != expected {
+		t.Fatalf("stored upstream generation TPS = %v, want %v", got, expected)
+	}
+}
+
 func TestAuditRepositorySumTokensByAccountsSince(t *testing.T) {
 	ctx := context.Background()
 	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit.db"))

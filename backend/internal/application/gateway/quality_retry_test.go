@@ -1594,12 +1594,14 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	var degraded, delivered bool
+	var deliveredGenerationTPS *float64
 	for _, rec := range logs {
 		if rec.ErrorCode == ErrorQualityDegraded && rec.AccountID != nil && *rec.AccountID == credentials[1].ID {
 			degraded = true
 		}
 		if rec.RequestID == "req-quality-hold" && rec.ErrorCode == "" && rec.StatusCode == http.StatusOK {
 			delivered = true
+			deliveredGenerationTPS = rec.UpstreamOutputTPS
 		}
 	}
 	if !degraded {
@@ -1607,6 +1609,9 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 	}
 	if !delivered {
 		t.Fatalf("final delivered attempt missing from audits, total=%d", total)
+	}
+	if deliveredGenerationTPS == nil || *deliveredGenerationTPS <= 0 {
+		t.Fatalf("successful audit must retain the delivered upstream candidate TPS, got %v", deliveredGenerationTPS)
 	}
 }
 
