@@ -174,8 +174,10 @@ func (c *responsesToolCompatibility) normalizeTool(raw any, namespace string, cl
 		c.applyBuildFunctionParameterCompatibility(converted, name, namespace, param+".parameters")
 		identity := responsesToolIdentity{Kind: responsesFunctionTool, Namespace: namespace, Name: name}
 		alias := c.alias(identity)
-		if parameters, exists := tool["parameters"]; exists && schemaContainsInteger(parameters) {
-			c.functionSchemas[alias] = cloneJSONValue(parameters)
+		if parameters, exists := tool["parameters"]; exists {
+			if normalizationSchema := functionArgumentNormalizationSchema(name, namespace, parameters); normalizationSchema != nil {
+				c.functionSchemas[alias] = normalizationSchema
+			}
 		}
 		converted["name"] = alias
 		if namespace != "" || alias != name {
@@ -260,6 +262,84 @@ func (c *responsesToolCompatibility) normalizeTool(raw any, namespace string, cl
 			return nil, &responsesRequestError{Message: param + ".type 不能为空", Param: param + ".type", Code: "invalid_parameter"}
 		}
 		return nil, unsupportedBuildToolError(kind, param)
+	}
+}
+
+// functionArgumentNormalizationSchema returns a private copy of the client
+// schema for response argument repair. Some Codex host tool declarations expose
+// duration and output limits as JSON numbers, while the tool executor accepts
+// only integral values. Keep that transport detail out of the visible and
+// upstream schemas, and only normalize the known integral fields.
+func functionArgumentNormalizationSchema(name, namespace string, parameters any) any {
+	schema := cloneJSONValue(parameters)
+	if schema == nil {
+		return nil
+	}
+	if markCodexIntegralFunctionFields(schema, name, namespace) || schemaContainsInteger(schema) {
+		return schema
+	}
+	return nil
+}
+
+func markCodexIntegralFunctionFields(schema any, name, namespace string) bool {
+	if strings.TrimSpace(namespace) != "" {
+		return false
+	}
+	var fields []string
+	switch strings.TrimSpace(name) {
+	case "exec_command":
+		fields = []string{"yield_time_ms", "max_output_tokens"}
+	case "write_stdin":
+		fields = []string{"session_id", "yield_time_ms", "max_output_tokens"}
+	case "wait":
+		fields = []string{"yield_time_ms", "max_tokens"}
+	default:
+		return false
+	}
+	changed := false
+	for _, field := range fields {
+		changed = markObjectPropertyInteger(schema, field) || changed
+	}
+	return changed
+}
+
+func markObjectPropertyInteger(schema any, field string) bool {
+	root, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	properties, ok := root["properties"].(map[string]any)
+	if !ok {
+		return false
+	}
+	property, ok := properties[field].(map[string]any)
+	if !ok {
+		return false
+	}
+	switch kind := property["type"].(type) {
+	case string:
+		if kind == "integer" {
+			return true
+		}
+		if kind != "number" {
+			return false
+		}
+		property["type"] = "integer"
+		return true
+	case []any:
+		changed := false
+		for index, value := range kind {
+			if value == "integer" {
+				return true
+			}
+			if value == "number" {
+				kind[index] = "integer"
+				changed = true
+			}
+		}
+		return changed
+	default:
+		return false
 	}
 }
 

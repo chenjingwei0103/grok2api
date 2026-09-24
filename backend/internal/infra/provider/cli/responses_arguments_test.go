@@ -275,3 +275,50 @@ func TestResponsesIntegerArgumentsBufferOverflowFallsBackToStreaming(t *testing.
 		t.Fatal("overflow did not release the buffered arguments")
 	}
 }
+
+func TestResponsesExecCommandNormalizesIntegralNumberStreamArguments(t *testing.T) {
+	request := []byte(`{
+		"model":"public","stream":true,
+		"tools":[{"type":"function","name":"exec_command","parameters":{
+			"type":"object","properties":{
+				"cmd":{"type":"string"},
+				"yield_time_ms":{"type":"number","minimum":10000},
+				"temperature":{"type":"number"}
+			}
+		}}]
+	}`)
+	_, compatibility, err := normalizeResponsesRequest(request, "grok-4.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatibility == nil {
+		t.Fatal("exec_command should install stream argument compatibility")
+	}
+	stream := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"exec_command","arguments":""}}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"yield_time_ms\":15000.0,\"temperature\":0.5}"}`,
+		``,
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"yield_time_ms\":15000.0,\"temperature\":0.5}"}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"yield_time_ms\":15000.0,\"temperature\":0.5}"}}`,
+		``,
+	}, "\n")
+	body, err := io.ReadAll(compatibility.normalizeResponseStream(io.NopCloser(strings.NewReader(stream))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `15000.0`) {
+		t.Fatalf("exec_command stream retained floating integer: %s", body)
+	}
+	if !strings.Contains(string(body), `\"yield_time_ms\":15000`) {
+		t.Fatalf("normalized exec_command arguments missing: %s", body)
+	}
+	if !strings.Contains(string(body), `\"temperature\":0.5`) {
+		t.Fatalf("ordinary decimal arguments changed: %s", body)
+	}
+}
