@@ -316,9 +316,11 @@ type QualityGuardRequestRetryConfig struct {
 // QualityGuardRequestRetryTraceConfig bounds private quality diagnostics.
 // The limits apply to individual previews, not the raw request or stream.
 type QualityGuardRequestRetryTraceConfig struct {
-	Enabled        bool `yaml:"enabled"`
-	InputMaxBytes  int  `yaml:"inputMaxBytes"`
-	OutputMaxBytes int  `yaml:"outputMaxBytes"`
+	Enabled                  bool   `yaml:"enabled"`
+	InputMaxBytes            int    `yaml:"inputMaxBytes"`
+	OutputMaxBytes           int    `yaml:"outputMaxBytes"`
+	CaptureAbnormalRequest   bool   `yaml:"captureAbnormalRequest"`
+	AbnormalRequestDirectory string `yaml:"abnormalRequestDirectory"`
 }
 
 type ClientKeyDefaultsConfig struct {

@@ -1027,6 +1027,22 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if qualityHoldEnabled && holdCfg.Trace.Enabled {
 		qualityRequestTrace = newQualityTraceRequest(input.Body, holdCfg.Trace.InputMaxBytes)
 	}
+	abnormalRequestCaptured := false
+	captureAbnormalRequest := func() {
+		if abnormalRequestCaptured || !holdCfg.Trace.CaptureAbnormalRequest {
+			return
+		}
+		abnormalRequestCaptured = true
+		path, err := writeAbnormalRequestFile(abnormalRequestFileCaptureConfig{
+			Enabled:   true,
+			Directory: holdCfg.Trace.AbnormalRequestDirectory,
+		}, input.Body)
+		if err != nil {
+			s.logger.Warn("quality_abnormal_request_capture_failed", "error", err)
+			return
+		}
+		s.logger.Info("quality_abnormal_request_captured", "path", path, "bytes", len(input.Body))
+	}
 	qualityClientSource := qualityTraceClientSource(input.Headers)
 	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), input.ForcedAccountID != 0 || (ownership != nil && !qualityHoldEnabled))
 	idempotencyID, _ := security.NewOpaqueToken(18)
@@ -1680,6 +1696,7 @@ attemptLoop:
 					Egress: snapshotQualityTraceEgress(credential, egressTrace, route.Provider), UpstreamURL: response.UpstreamURL,
 				}
 				if peek.verdict == QualityWithhold {
+					captureAbnormalRequest()
 					cooldown := holdCfg.AccountCooldown
 					// Usage not reported yet (logged as output_tokens=0) is the
 					// empty/short-hold path, not a confirmed 128k missing-thinking

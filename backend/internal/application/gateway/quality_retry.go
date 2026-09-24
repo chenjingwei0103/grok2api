@@ -79,9 +79,11 @@ type QualityRetryRuntime struct {
 // inside the request retry runtime so settings hot reloads update it together
 // with the classifier thresholds.
 type QualityTraceRuntime struct {
-	Enabled        bool
-	InputMaxBytes  int
-	OutputMaxBytes int
+	Enabled                  bool
+	InputMaxBytes            int
+	OutputMaxBytes           int
+	CaptureAbnormalRequest   bool
+	AbnormalRequestDirectory string
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this
@@ -104,6 +106,10 @@ type QualityStreamSignals struct {
 	Terminal              bool
 	HoldExpired           bool
 	OutputTokensPerSecond float64
+	// ToolCallOnly marks a terminal response whose semantic output is a tool
+	// call and which contains no user-visible text. Tool arguments are not
+	// ordinary answer text and must not trigger the output-speed guard.
+	ToolCallOnly bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -354,6 +360,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 // delivered a buffered chunk quickly. The threshold is independent of output
 // length: even a one-token terminal response is retried when it exceeds it.
 func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, maxOutputTokensPerSecond float64) QualityVerdict {
+	if sig.Terminal && sig.ToolCallOnly {
+		return QualityDeliver
+	}
 	if maxOutputTokensPerSecond > 0 && sig.Terminal {
 		if sig.OutputTokensPerSecond > maxOutputTokensPerSecond {
 			return QualityWithhold

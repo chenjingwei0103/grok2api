@@ -30,6 +30,7 @@ type qualityScanState struct {
 	visibleRunes                    int
 	aggregateRunes                  int
 	semanticOutput                  bool
+	toolCallSeen                    bool
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
@@ -165,6 +166,11 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
 	}
 	outputTokensForSpeed := output
+	if s.toolCallSeen {
+		// Provider usage often includes tool arguments. For a response that
+		// contains a tool call, measure only visible/reasoning output instead.
+		outputTokensForSpeed = visible + reasoningTokens
+	}
 	if outputTokensForSpeed <= 0 {
 		outputTokensForSpeed = visible + reasoningTokens
 	}
@@ -193,6 +199,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		Terminal:              s.terminal,
 		HoldExpired:           s.holdExpired,
 		OutputTokensPerSecond: outputTokensPerSecond,
+		ToolCallOnly:          s.toolCallSeen && visible <= 0,
 	}
 }
 
@@ -322,6 +329,7 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 		if len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
 			state.markGenerated()
 			state.semanticOutput = true
+			state.toolCallSeen = true
 		}
 		if choice.FinishReason != "" {
 			state.markTerminal()
@@ -398,6 +406,7 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 		if event.Delta != "" {
 			state.markGenerated()
 			state.semanticOutput = true
+			state.toolCallSeen = true
 		}
 	}
 	if event.Response != nil {
@@ -473,8 +482,24 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 		// Function, shell, MCP and other call items are meaningful output even
 		// when the provider omits usage and argument-delta events.
 		state.semanticOutput = true
+		if isQualityToolCallType(item.Type) {
+			state.toolCallSeen = true
+		}
 	}
 	return visibleRunes
+}
+
+func isQualityToolCallType(itemType string) bool {
+	typ := strings.ToLower(strings.TrimSpace(itemType))
+	if typ == "tool_use" || strings.HasSuffix(typ, "_tool_use") || strings.HasSuffix(typ, "_call") {
+		return true
+	}
+	switch typ {
+	case "function_call", "custom_tool_call", "shell_call", "mcp_call", "computer_call", "code_interpreter_call", "file_search_call", "web_search_call", "image_generation_call":
+		return true
+	default:
+		return false
+	}
 }
 
 func observeQualityAnthropic(state *qualityScanState, payload []byte) {
@@ -519,10 +544,17 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 				noteVisibleContent(state, event.ContentBlock.Text)
 				state.semanticOutput = true
 			}
+		case "tool_use", "server_tool_use":
+			state.markGenerated()
+			state.semanticOutput = true
+			state.toolCallSeen = true
 		case "":
 		default:
 			state.markGenerated()
 			state.semanticOutput = true
+			if isQualityToolCallType(event.ContentBlock.Type) {
+				state.toolCallSeen = true
+			}
 		}
 	case "content_block_delta":
 		if event.Delta.Type == "thinking_delta" && strings.TrimSpace(event.Delta.Thinking) != "" {
@@ -542,6 +574,7 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		if event.Delta.Type == "input_json_delta" && event.Delta.PartialJSON != "" {
 			state.markGenerated()
 			state.semanticOutput = true
+			state.toolCallSeen = true
 		}
 	}
 	if event.Usage != nil {

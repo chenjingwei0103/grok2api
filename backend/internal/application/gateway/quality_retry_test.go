@@ -797,6 +797,103 @@ func TestPeekQualityStreamHighSpeedThinkingWithholdsAtTerminal(t *testing.T) {
 	}
 }
 
+func TestPeekQualityStreamHighSpeedFunctionCallDelivers(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	done := make(chan qualityOpenPeekResult, 1)
+	go func() {
+		replay, verdict, _, _, err := peekQualityStream(
+			context.Background(), reader, qualityProtocolResponses,
+			QualityRetryRuntime{
+				MinOutputTokens:          8,
+				HoldTimeout:              time.Second,
+				MaxOutputTokensPerSecond: 1000,
+			},
+		)
+		done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
+	}()
+
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"exec_command","arguments":""}}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":""}],"usage":{"output_tokens":80,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+		"data: [DONE]",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			defer result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityDeliver {
+			t.Fatalf("high-speed function call verdict = %s, want deliver", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quality peek did not finish")
+	}
+}
+
+func TestPeekQualityStreamToolCallUsesVisibleTextForSpeed(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	done := make(chan qualityOpenPeekResult, 1)
+	go func() {
+		replay, verdict, _, _, err := peekQualityStream(
+			context.Background(), reader, qualityProtocolResponses,
+			QualityRetryRuntime{
+				MinOutputTokens:          8,
+				HoldTimeout:              time.Second,
+				MaxOutputTokensPerSecond: 1000,
+			},
+		)
+		done <- qualityOpenPeekResult{replay: replay, verdict: verdict, err: err}
+	}()
+
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"exec_command","arguments":""}}`,
+		`data: {"type":"response.output_text.delta","delta":"ok"}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":""},{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"output_tokens":80,"output_tokens_details":{"reasoning_tokens":0}}}}`,
+		"data: [DONE]",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			defer result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityDeliver {
+			t.Fatalf("short mixed function call verdict = %s, want deliver", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quality peek did not finish")
+	}
+}
+
 func TestPeekQualityStreamHighSpeedEncryptedThinkingWaitsForTerminal(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
