@@ -1096,6 +1096,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				// the same audit record before attempts are snapshotted.
 				if traceReader != nil {
 					traceReader.finish()
+					if outputTPS := traceReader.capture().signals().OutputTokensPerSecond; outputTPS > 0 {
+						upstreamOutputTokensPerSecond = outputTPS
+					}
 				}
 				// HTTP 状态码保留线上真实值；流在 2xx 响应头之后失败时由 errorCode
 				// 决定最终结果，避免把协议状态与业务结果混为一谈。
@@ -1762,9 +1765,27 @@ attemptLoop:
 					lease.Release()
 					break attemptLoop
 				}
-				if holdCfg.Trace.Enabled {
+				if holdCfg.Trace.Enabled || holdCfg.MaxOutputTokensPerSecond > 0 {
 					traceReader = newQualityTraceReadCloser(response.Body, peek.capture, func(capture qualityStreamCapture) {
-						failureAttempts.captureQualityTrace(credential, responseStartedAt, traceInput.withCapture(capture))
+						signals := capture.signals()
+						highSpeed := signals.Terminal && !signals.ToolCallOnly && holdCfg.MaxOutputTokensPerSecond > 0 && signals.OutputTokensPerSecond > holdCfg.MaxOutputTokensPerSecond
+						if highSpeed {
+							captureAbnormalRequest()
+							usage := capture.state.usage
+							usage.OutputTokensPerSecond = signals.OutputTokensPerSecond
+							s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+							if holdCfg.Trace.Enabled {
+								postDeliveryTrace := traceInput.withCapture(capture)
+								postDeliveryTrace.Verdict = QualityWithhold
+								postDeliveryTrace.Action = "post_delivery_cooldown"
+								failureAttempts.captureQualityTrace(credential, responseStartedAt, postDeliveryTrace)
+							} else {
+								failureAttempts.captureQualityDegraded(credential, responseStartedAt)
+							}
+							s.recordQualityDegraded(ctx, auditBase, credential, usage, startedAt, egressTrace, route.Provider)
+						} else if holdCfg.Trace.Enabled {
+							failureAttempts.captureQualityTrace(credential, responseStartedAt, traceInput.withCapture(capture))
+						}
 					})
 					response.Body = traceReader
 				}

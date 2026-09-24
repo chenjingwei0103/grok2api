@@ -153,6 +153,13 @@ func (r *qualityTraceReadCloser) Close() error {
 	return r.source.Close()
 }
 
+func (r *qualityTraceReadCloser) capture() qualityStreamCapture {
+	if r == nil {
+		return qualityStreamCapture{}
+	}
+	return newQualityStreamCapture(r.protocol, r.state, r.heldBytes, r.heldTruncated)
+}
+
 func (r *qualityTraceReadCloser) finish() {
 	if r == nil {
 		return
@@ -161,7 +168,7 @@ func (r *qualityTraceReadCloser) finish() {
 		if r.onFinish == nil {
 			return
 		}
-		r.onFinish(newQualityStreamCapture(r.protocol, r.state, r.heldBytes, r.heldTruncated))
+		r.onFinish(r.capture())
 	})
 }
 

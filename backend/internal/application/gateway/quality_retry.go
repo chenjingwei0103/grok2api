@@ -368,13 +368,6 @@ func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, max
 			return QualityWithhold
 		}
 	}
-	if maxOutputTokensPerSecond > 0 && !sig.Terminal && sig.HasThinking {
-		// The final usage frame is needed to measure the same output Token/s
-		// value shown by the audit panel. This applies to plaintext and
-		// encrypted thinking alike; releasing encrypted thinking early bypasses
-		// the speed guard before the terminal event supplies its denominator.
-		return QualityWait
-	}
 	return ClassifyQualityHold(sig, minOutput)
 }
 

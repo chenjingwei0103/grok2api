@@ -84,14 +84,14 @@ func TestClassifyQualityHoldWithSpeed(t *testing.T) {
 
 	midstream := degraded
 	midstream.Terminal = false
-	if got := classifyQualityHoldWithSpeed(midstream, 8, 1000); got != QualityWait {
-		t.Fatalf("midstream speed verdict = %s, want wait for terminal evidence", got)
+	if got := classifyQualityHoldWithSpeed(midstream, 8, 1000); got != QualityDeliver {
+		t.Fatalf("plaintext midstream speed verdict = %s, want deliver", got)
 	}
 
 	encryptedMidstream := midstream
 	encryptedMidstream.PlaintextThinking = false
 	if got := classifyQualityHoldWithSpeed(encryptedMidstream, 8, 1000); got != QualityWait {
-		t.Fatalf("encrypted midstream speed verdict = %s, want wait for terminal evidence", got)
+		t.Fatalf("encrypted midstream speed verdict = %s, want early evidence", got)
 	}
 
 	if got := classifyQualityHoldWithSpeed(degraded, 8, 0); got != QualityDeliver {
@@ -747,7 +747,7 @@ func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 	}
 }
 
-func TestPeekQualityStreamHighSpeedThinkingWithholdsAtTerminal(t *testing.T) {
+func TestPeekQualityStreamHighSpeedPlaintextThinkingDeliversBeforeTerminal(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
 	done := make(chan qualityOpenPeekResult, 1)
@@ -770,7 +770,34 @@ func TestPeekQualityStreamHighSpeedThinkingWithholdsAtTerminal(t *testing.T) {
 	)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
+
+	var result qualityOpenPeekResult
+	select {
+	case result = <-done:
+		if result.replay != nil {
+			defer result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityDeliver {
+			t.Fatalf("high-speed plaintext thinking verdict = %s, want deliver", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("plaintext thinking stream was held until terminal")
+	}
+
+	readDone := make(chan struct {
+		body []byte
+		err  error
+	}, 1)
+	go func() {
+		body, err := io.ReadAll(result.replay)
+		readDone <- struct {
+			body []byte
+			err  error
+		}{body: body, err: err}
+	}()
 	if _, err := io.WriteString(writer, sse(
 		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":40}}}`,
 		"data: [DONE]",
@@ -782,18 +809,44 @@ func TestPeekQualityStreamHighSpeedThinkingWithholdsAtTerminal(t *testing.T) {
 	}
 
 	select {
-	case result := <-done:
-		if result.replay != nil {
-			defer result.replay.Close()
+	case read := <-readDone:
+		if read.err != nil {
+			t.Fatal(read.err)
 		}
-		if result.err != nil {
-			t.Fatal(result.err)
-		}
-		if result.verdict != QualityWithhold {
-			t.Fatalf("high-speed thinking verdict = %s, want withhold", result.verdict)
+		if !strings.Contains(string(read.body), "thinking_content") || !strings.Contains(string(read.body), content) {
+			t.Fatalf("replay lost early plaintext reasoning: %s", read.body)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("quality peek did not finish")
+		t.Fatal("replay did not finish")
+	}
+}
+
+func TestQualityTraceReadCloserCapturesFinalTPSAfterEarlyDelivery(t *testing.T) {
+	t.Parallel()
+	prefix := sse(
+		`data: {"choices":[{"delta":{"thinking_content":"plan"}}]}`,
+		`data: {"choices":[{"delta":{"content":"answer"}}]}`,
+	)
+	state := qualityScanState{protocol: qualityProtocolChat, startedAt: time.Now().Add(-time.Second)}
+	ObserveQualityChunk(&state, []byte(prefix))
+	initial := newQualityStreamCapture(qualityProtocolChat, state, len(prefix), false)
+	terminal := sse(
+		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)
+	reader := newQualityTraceReadCloser(io.NopCloser(strings.NewReader(prefix+terminal)), initial, nil)
+	if _, err := io.ReadAll(reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	signals := reader.capture().signals()
+	if !signals.Terminal {
+		t.Fatal("final trace must be terminal")
+	}
+	if signals.OutputTokensPerSecond <= 0 {
+		t.Fatalf("final TPS = %v, want positive", signals.OutputTokensPerSecond)
 	}
 }
 
@@ -894,7 +947,7 @@ func TestPeekQualityStreamToolCallUsesVisibleTextForSpeed(t *testing.T) {
 	}
 }
 
-func TestPeekQualityStreamHighSpeedEncryptedThinkingWaitsForTerminal(t *testing.T) {
+func TestPeekQualityStreamHighSpeedEncryptedThinkingWithholdsBeforeTerminal(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
 	done := make(chan qualityOpenPeekResult, 1)
@@ -925,33 +978,17 @@ func TestPeekQualityStreamHighSpeedEncryptedThinkingWaitsForTerminal(t *testing.
 		if result.replay != nil {
 			_ = result.replay.Close()
 		}
-		t.Fatalf("encrypted thinking stream released before terminal: verdict=%s err=%v", result.verdict, result.err)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	if _, err := io.WriteString(writer, sse(
-		`data: {"type":"response.completed","response":{"id":"resp_1","usage":{"output_tokens":80,"output_tokens_details":{"reasoning_tokens":40}}}}`,
-		"data: [DONE]",
-	)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case result := <-done:
-		if result.replay != nil {
-			defer result.replay.Close()
-		}
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
 		if result.verdict != QualityWithhold {
-			t.Fatalf("high-speed encrypted thinking verdict = %s, want withhold", result.verdict)
+			t.Fatalf("encrypted thinking early verdict = %s, want withhold", result.verdict)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("quality peek did not finish")
+		t.Fatal("encrypted thinking stream was not classified before terminal")
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
