@@ -33,18 +33,18 @@ func TestClassifyQualityHold(t *testing.T) {
 		want QualityVerdict
 	}{
 		{name: "thinking delivers", sig: QualityStreamSignals{HasThinking: true, PlaintextThinking: true, VisibleTokens: 10}, want: QualityDeliver},
-		{name: "usage reasoning tokens alone withhold", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityWithhold},
-		{name: "visible 32 no think withhold", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityWithhold},
-		{name: "output 40 no think withhold", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
+		{name: "usage reasoning tokens alone delivers", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityDeliver},
+		{name: "visible 32 no think delivers", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityDeliver},
+		{name: "output 40 no think delivers", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityDeliver},
 		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityDeliver},
 		{name: "short no think delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
 		{name: "empty terminal waits for transport handling", sig: QualityStreamSignals{Terminal: true}, want: QualityWait},
-		{name: "midstream enough content withhold", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWithhold},
-		{name: "stub midstream waits even with enough visible", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64}, want: QualityWait},
-		{name: "stub hold expiry with enough visible withholds", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, HoldExpired: true}, want: QualityWithhold},
+		{name: "midstream enough content delivers", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityDeliver},
+		{name: "stub midstream delivers once visible", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64}, want: QualityDeliver},
+		{name: "stub hold expiry with enough visible delivers", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, HoldExpired: true}, want: QualityDeliver},
 		{name: "stub-only hold expiry keeps waiting", sig: QualityStreamSignals{ReasoningStarted: true, HoldExpired: true}, want: QualityWait},
-		{name: "stub terminal enough withhold", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, Terminal: true}, want: QualityWithhold},
-		{name: "wait for more", sig: QualityStreamSignals{VisibleTokens: 8}, want: QualityWait},
+		{name: "stub terminal enough delivers", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, Terminal: true}, want: QualityDeliver},
+		{name: "small visible content delivers", sig: QualityStreamSignals{VisibleTokens: 8}, want: QualityDeliver},
 		{name: "hold expired short delivers", sig: QualityStreamSignals{VisibleTokens: 8, HoldExpired: true}, want: QualityDeliver},
 		{name: "hold expired empty waits", sig: QualityStreamSignals{HoldExpired: true}, want: QualityWait},
 		{name: "hold expired zero tokens waits", sig: QualityStreamSignals{VisibleTokens: 0, OutputTokens: 0, HoldExpired: true}, want: QualityWait},
@@ -430,8 +430,8 @@ func TestObserveQualityChunkNoThinkEnoughChat(t *testing.T) {
 	if sig.HasThinking || !sig.Terminal || sig.VisibleTokens < 32 {
 		t.Fatalf("no-think fixture signals = %#v", sig)
 	}
-	if ClassifyQualityHold(sig, 32) != QualityWithhold {
-		t.Fatalf("no-think enough should withhold, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
+	if ClassifyQualityHold(sig, 32) != QualityDeliver {
+		t.Fatalf("no-think content should deliver, got %s (%#v)", ClassifyQualityHold(sig, 32), sig)
 	}
 }
 
@@ -609,8 +609,8 @@ func TestObserveQualityChunkResponsesReasoningItem(t *testing.T) {
 	if !fakeSig.ReasoningStarted || fakeSig.ReasoningTokens != 60 {
 		t.Fatalf("usage-only signals = %#v", fakeSig)
 	}
-	if ClassifyQualityHold(fakeSig, 32) != QualityWithhold {
-		t.Fatalf("usage-only reasoning with no deltas must withhold: %#v", fakeSig)
+	if ClassifyQualityHold(fakeSig, 32) != QualityDeliver {
+		t.Fatalf("usage-only reasoning with visible output should deliver: %#v", fakeSig)
 	}
 
 	real := qualityScanState{protocol: qualityProtocolResponses}
@@ -641,8 +641,8 @@ func TestObserveQualityChunkResponsesReasoningItem(t *testing.T) {
 	if shortSig.EncryptedBytes == 0 || !shortSig.ReasoningStarted || shortSig.ReasoningTokens != 60 {
 		t.Fatalf("short encrypted stub signals = %#v", shortSig)
 	}
-	if ClassifyQualityHold(shortSig, 32) != QualityWithhold {
-		t.Fatalf("short encrypted stub must withhold: %#v", shortSig)
+	if ClassifyQualityHold(shortSig, 32) != QualityDeliver {
+		t.Fatalf("short encrypted stub with visible output should deliver: %#v", shortSig)
 	}
 
 	cipher := strings.Repeat("A", defaultMinEncryptedBytes*8)
@@ -672,8 +672,8 @@ func TestObserveQualityChunkResponsesReasoningItem(t *testing.T) {
 	if underSig.HasThinking {
 		t.Fatalf("256B cipher must not satisfy 1000 reasoning tokens: %#v", underSig)
 	}
-	if ClassifyQualityHold(underSig, 32) != QualityWithhold {
-		t.Fatalf("undersized cipher vs usage must withhold: %#v", underSig)
+	if ClassifyQualityHold(underSig, 32) != QualityDeliver {
+		t.Fatalf("undersized cipher with visible output should deliver: %#v", underSig)
 	}
 }
 
@@ -694,8 +694,8 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	if !chatSig.ReasoningStarted || !chatSig.Terminal || chatSig.ReasoningTokens != 0 {
 		t.Fatalf("chat stub signals = %#v", chatSig)
 	}
-	if ClassifyQualityHold(chatSig, 32) != QualityWithhold {
-		t.Fatalf("chat stub + 0 reasoning must withhold, got %s (%#v)", ClassifyQualityHold(chatSig, 32), chatSig)
+	if ClassifyQualityHold(chatSig, 32) != QualityDeliver {
+		t.Fatalf("chat stub with visible output should deliver, got %s (%#v)", ClassifyQualityHold(chatSig, 32), chatSig)
 	}
 
 	mid := qualityScanState{protocol: qualityProtocolChat}
@@ -707,8 +707,8 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	if midSig.HasThinking || !midSig.ReasoningStarted || midSig.Terminal {
 		t.Fatalf("midstream stub signals = %#v", midSig)
 	}
-	if ClassifyQualityHold(midSig, 32) != QualityWait {
-		t.Fatalf("midstream stub must wait for usage, got %s (%#v)", ClassifyQualityHold(midSig, 32), midSig)
+	if ClassifyQualityHold(midSig, 32) != QualityDeliver {
+		t.Fatalf("midstream stub with visible output should deliver, got %s (%#v)", ClassifyQualityHold(midSig, 32), midSig)
 	}
 
 	responses := qualityScanState{protocol: qualityProtocolResponses}
@@ -721,8 +721,8 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	if respSig.HasThinking {
 		t.Fatalf("empty responses reasoning item must not count as thinking: %#v", respSig)
 	}
-	if ClassifyQualityHold(respSig, 32) != QualityWithhold {
-		t.Fatalf("empty reasoning item + 0 tokens must withhold, got %s (%#v)", ClassifyQualityHold(respSig, 32), respSig)
+	if ClassifyQualityHold(respSig, 32) != QualityDeliver {
+		t.Fatalf("empty reasoning item with visible output should deliver, got %s (%#v)", ClassifyQualityHold(respSig, 32), respSig)
 	}
 }
 
@@ -992,7 +992,7 @@ func TestPeekQualityStreamHighSpeedEncryptedThinkingWithholdsBeforeTerminal(t *t
 	}
 }
 
-func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
+func TestPeekQualityStreamDeliversNoThinkContent(t *testing.T) {
 	t.Parallel()
 	content := strings.Repeat("abcd", 16) // 64 runes → 16 tokens... need 32 tokens = 128 runes
 	content = strings.Repeat("abcd", 40)  // 160 runes → 40 tokens
@@ -1006,7 +1006,7 @@ func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	if verdict != QualityWithhold {
+	if verdict != QualityDeliver {
 		t.Fatalf("verdict=%s usage=%#v", verdict, usage)
 	}
 	if usage.ReasoningTokens != 0 || usage.OutputTokens < 32 {
@@ -1014,7 +1014,7 @@ func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
 	}
 }
 
-func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
+func TestPeekNoThinkContentDoesNotRetry(t *testing.T) {
 	t.Parallel()
 	content := strings.Repeat("abcd", 40)
 	fixture := sse(
@@ -1029,11 +1029,11 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay.Close()
-	if verdict != QualityWithhold {
+	if verdict != QualityDeliver {
 		t.Fatalf("first peek verdict=%s usage=%#v", verdict, usage)
 	}
-	if got := DecideQualityRetry(verdict, 0, cfg.MaxAttempts, cfg.OnExhausted); got != QualityActionRetry {
-		t.Fatalf("first withhold action=%s", got)
+	if got := DecideQualityRetry(verdict, 0, cfg.MaxAttempts, cfg.OnExhausted); got != QualityActionDeliver {
+		t.Fatalf("first deliver action=%s", got)
 	}
 
 	replay2, verdict2, _, _, err := peekQualityStream(context.Background(), io.NopCloser(strings.NewReader(fixture)), qualityProtocolChat, cfg)
@@ -1041,13 +1041,13 @@ func TestPeekThenDecideQualityRetryBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replay2.Close()
-	if verdict2 != QualityWithhold {
+	if verdict2 != QualityDeliver {
 		t.Fatalf("second peek verdict=%s", verdict2)
 	}
 	action2 := DecideQualityRetry(verdict2, 1, cfg.MaxAttempts, cfg.OnExhausted)
 	action2 = BoundQualityRetry(action2, false, cfg.OnExhausted)
-	if action2 != QualityActionDeliverLast {
-		t.Fatalf("second withhold fail-open action=%s", action2)
+	if action2 != QualityActionDeliver {
+		t.Fatalf("second deliver action=%s", action2)
 	}
 	got, _ := io.ReadAll(replay2)
 	if !strings.Contains(string(got), content) {
