@@ -239,9 +239,6 @@ func validateVideoRouteParameters(providerValue account.Provider, operation prov
 	}
 	trimmedModel := strings.TrimSpace(upstreamModel)
 	hasReferences := referenceCount > 0
-	if providerValue == account.ProviderWeb && (hasImage || hasReferences) {
-		return fmt.Errorf("%w: Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider", ErrVideoOperationUnsupported)
-	}
 	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
 		// 实测：8 张 reference_images 上游回 400
 		// "Too many reference images: 8. Maximum allowed is 7."（两个视频模型一致）。

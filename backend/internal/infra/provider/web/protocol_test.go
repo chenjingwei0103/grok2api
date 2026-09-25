@@ -1549,7 +1549,7 @@ func TestParseVideoStreamFixture(t *testing.T) {
 }
 
 func TestTextToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
-	payload := videoCreatePayload("雨后天晴！", "9:16", "480p", 6)
+	payload := videoCreatePayload("雨后天晴！", "9:16", "480p", 6, "", nil)
 	if len(payload) != 8 || payload["modelName"] != "imagine-video-gen" ||
 		payload["message"] != "雨后天晴！ --mode=custom" ||
 		payload["enableImageStreaming"] != true || payload["enableSideBySide"] != true ||
@@ -1587,6 +1587,84 @@ func TestTextToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 		if _, exists := payload[field]; exists {
 			t.Fatalf("legacy field %q leaked into text-to-video payload: %#v", field, payload)
 		}
+	}
+}
+
+func TestReferenceToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
+	payload := videoCreatePayload("animate", "", "480p", 6, "first-frame", []string{"reference-1", "reference-2"})
+	mediaGenInput, ok := payload["mediaGenInput"].(map[string]any)
+	if !ok {
+		t.Fatalf("mediaGenInput = %#v", payload["mediaGenInput"])
+	}
+	value, ok := mediaGenInput["referenceToVideo"].(map[string]any)
+	if !ok || len(mediaGenInput) != 1 {
+		t.Fatalf("referenceToVideo = %#v", mediaGenInput)
+	}
+	assets, ok := value["inputAssets"].([]string)
+	if !ok || !slices.Equal(assets, []string{"reference-1", "reference-2"}) {
+		t.Fatalf("inputAssets = %#v", value["inputAssets"])
+	}
+	if value["prompt"] != "animate" || value["duration"] != 6 || value["resolutionName"] != "480p" || value["firstFrameAsset"] != "first-frame" {
+		t.Fatalf("referenceToVideo = %#v", value)
+	}
+	if _, exists := value["aspectRatio"]; exists {
+		t.Fatalf("empty aspect ratio must be omitted: %#v", value)
+	}
+}
+
+func TestGenerateVideoUploadsReferenceImagesAndUsesReferenceToVideo(t *testing.T) {
+	var uploads int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/http/upload-file-v2/direct":
+			uploads++
+			if err := request.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("parse upload: %v", err)
+			}
+			if request.FormValue("file_source") != imagineSelfUploadSource {
+				t.Errorf("file source = %q", request.FormValue("file_source"))
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"fileMetadata":{"fileMetadataId":"reference-%d"}}`, uploads))
+		case "/rest/app-chat/conversations/new":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode video payload: %v", err)
+			}
+			mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
+			referenceToVideo, _ := mediaGenInput["referenceToVideo"].(map[string]any)
+			assets, _ := referenceToVideo["inputAssets"].([]any)
+			if len(assets) != 1 || assets[0] != "reference-1" || referenceToVideo["prompt"] != "animate" {
+				t.Errorf("referenceToVideo = %#v", referenceToVideo)
+			}
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedToken, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test", VideoTimeoutSeconds: 5}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	request := provider.VideoRequest{
+		Credential:    account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
+		Prompt:        "animate",
+		Duration:      6,
+		AspectRatio:   "16:9",
+		Resolution:    "720p",
+		ReferenceURLs: []string{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg=="},
+	}
+	result, err := adapter.GenerateVideo(context.Background(), request)
+	if err != nil || result.URL != "https://assets.grok.com/videos/final.mp4" || uploads != 1 {
+		t.Fatalf("result=%#v uploads=%d err=%v", result, uploads, err)
 	}
 }
 

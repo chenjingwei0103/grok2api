@@ -16,6 +16,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
@@ -250,8 +251,8 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
-	if strings.TrimSpace(request.ImageURL) != "" || len(request.ReferenceURLs) > 0 {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider"))
+	if len(request.ReferenceAudios) > 0 {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前不支持 reference_audios"))
 	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
@@ -272,8 +273,12 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if resolution == "" {
 		resolution = "720p"
 	}
-	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
-	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
+	firstFrameAsset, referenceAssets, err := a.uploadVideoReferenceAssets(ctx, cfg, lease, token, request)
+	if err != nil {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
+	}
+	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0], firstFrameAsset, referenceAssets)
+	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
@@ -293,6 +298,45 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePoll, 0, fmt.Errorf("视频生成完成但没有返回内容 URL"))
 	}
 	return result, nil
+}
+
+func (a *Adapter) uploadVideoReferenceAssets(ctx context.Context, cfg Config, lease *infraegress.Lease, token string, request provider.VideoRequest) (string, []string, error) {
+	upload := func(rawURL, stage string) (string, error) {
+		image, err := a.loadChatImage(ctx, lease, rawURL, cfg.MaxInputImageBytes)
+		if err != nil {
+			return "", err
+		}
+		uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, stage)
+		if err != nil {
+			return "", err
+		}
+		if uploaded.MetadataID == "" {
+			return "", fmt.Errorf("上传视频参考图成功但上游未返回 fileMetadataId")
+		}
+		return uploaded.MetadataID, nil
+	}
+
+	firstFrameAsset := ""
+	if rawURL := strings.TrimSpace(request.ImageURL); rawURL != "" {
+		asset, err := upload(rawURL, "video_first_frame_upload")
+		if err != nil {
+			return "", nil, err
+		}
+		firstFrameAsset = asset
+	}
+	referenceAssets := make([]string, 0, len(request.ReferenceURLs))
+	for _, rawURL := range request.ReferenceURLs {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
+			continue
+		}
+		asset, err := upload(rawURL, "video_reference_upload")
+		if err != nil {
+			return "", nil, err
+		}
+		referenceAssets = append(referenceAssets, asset)
+	}
+	return firstFrameAsset, referenceAssets, nil
 }
 
 // DownloadVideo retrieves a completed Grok asset through its source SSO
@@ -520,7 +564,24 @@ func videoSegments(seconds int) []int {
 // In particular, the generation parameters belong in mediaGenInput rather
 // than the legacy modelConfigOverride map. Keeping this shape explicit also
 // prevents text-to-video from depending on a synthetic media post.
-func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[string]any {
+func videoCreatePayload(prompt, ratio, resolution string, seconds int, firstFrameAsset string, referenceAssets []string) map[string]any {
+	mediaGenInput := map[string]any{}
+	if firstFrameAsset == "" && len(referenceAssets) == 0 {
+		mediaGenInput["textToVideo"] = map[string]any{
+			"prompt": prompt, "aspectRatio": ratio, "duration": seconds, "resolutionName": resolution,
+		}
+	} else {
+		referenceToVideo := map[string]any{
+			"prompt": prompt, "inputAssets": referenceAssets, "duration": seconds, "resolutionName": resolution,
+		}
+		if ratio != "" {
+			referenceToVideo["aspectRatio"] = ratio
+		}
+		if firstFrameAsset != "" {
+			referenceToVideo["firstFrameAsset"] = firstFrameAsset
+		}
+		mediaGenInput["referenceToVideo"] = referenceToVideo
+	}
 	return map[string]any{
 		"modelName":            "imagine-video-gen",
 		"message":              prompt + " --mode=custom",
@@ -533,14 +594,7 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[strin
 				"modelMap": map[string]any{},
 			},
 		},
-		"mediaGenInput": map[string]any{
-			"textToVideo": map[string]any{
-				"prompt":         prompt,
-				"aspectRatio":    ratio,
-				"duration":       seconds,
-				"resolutionName": resolution,
-			},
-		},
-		"kind": "CONVERSATION_KIND_IMAGINE",
+		"mediaGenInput": mediaGenInput,
+		"kind":          "CONVERSATION_KIND_IMAGINE",
 	}
 }
