@@ -1591,7 +1591,7 @@ func TestTextToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 }
 
 func TestReferenceToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
-	payload := videoCreatePayload("animate", "", "480p", 6, "first-frame", []string{"reference-1", "reference-2"})
+	payload := videoCreatePayload("animate", "9:16", "480p", 6, "first-frame", []string{"reference-1", "reference-2"})
 	mediaGenInput, ok := payload["mediaGenInput"].(map[string]any)
 	if !ok {
 		t.Fatalf("mediaGenInput = %#v", payload["mediaGenInput"])
@@ -1608,7 +1608,7 @@ func TestReferenceToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) 
 		t.Fatalf("referenceToVideo = %#v", value)
 	}
 	if _, exists := value["aspectRatio"]; exists {
-		t.Fatalf("empty aspect ratio must be omitted: %#v", value)
+		t.Fatalf("reference-to-video aspect ratio must be omitted: %#v", value)
 	}
 }
 

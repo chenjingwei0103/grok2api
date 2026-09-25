@@ -571,11 +571,11 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int, firstFram
 			"prompt": prompt, "aspectRatio": ratio, "duration": seconds, "resolutionName": resolution,
 		}
 	} else {
+		// The captured Grok Imagine reference-to-video request derives framing
+		// from its uploaded assets and omits aspectRatio. Keep this wire shape
+		// separate from textToVideo, which accepts an explicit aspect ratio.
 		referenceToVideo := map[string]any{
 			"prompt": prompt, "inputAssets": referenceAssets, "duration": seconds, "resolutionName": resolution,
-		}
-		if ratio != "" {
-			referenceToVideo["aspectRatio"] = ratio
 		}
 		if firstFrameAsset != "" {
 			referenceToVideo["firstFrameAsset"] = firstFrameAsset
