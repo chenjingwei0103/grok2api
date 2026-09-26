@@ -325,12 +325,29 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if output <= 0 {
 		output = sig.OutputTokens
 	}
-	// Do not withhold a response solely because it lacks reasoning deltas or
-	// reasoning_tokens. Some valid Grok streams, including long Responses API
-	// turns, contain only visible text even when high reasoning was requested.
-	// Dedicated empty-stream, encrypted-dump, burst-dump, and terminal TPS
-	// checks above still retain their own quality handling.
-	if output > 0 {
+	enough := output >= minOutput
+	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
+		return QualityWait
+	}
+	if sig.Terminal {
+		if output <= 0 {
+			return QualityWait
+		}
+		if enough {
+			return QualityWithhold
+		}
+		return QualityDeliver
+	}
+	if enough {
+		return QualityWithhold
+	}
+	if sig.HoldExpired {
+		if output <= 0 {
+			return QualityWait
+		}
+		if enough {
+			return QualityWithhold
+		}
 		return QualityDeliver
 	}
 	return QualityWait
