@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1831,6 +1832,99 @@ func TestAttemptLoopQualityHoldFailOpenKeepsSingleAccountBody(t *testing.T) {
 	}
 	if !cooled.Enabled || cooled.LastError != lastErrorMissingThinking || cooled.CooldownUntil == nil {
 		t.Fatalf("delivered fail-open response must still cool the no-thinking account: %#v", cooled)
+	}
+}
+
+func TestAttemptLoopCapturesDeliveredReportedZeroReasoningRequest(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-zero-reasoning.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "quality-zero-reasoning", SourceKey: "quality-zero-reasoning",
+		EncryptedAccessToken: "quality-zero-reasoning", EncryptedRefreshToken: "refresh-quality-zero-reasoning",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "quality-zero-reasoning-key", Prefix: "qzero", SecretHash: strings.Repeat("c", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestBody := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"say hello"}],"stream":true}`)
+	responseBody := sse(
+		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
+		`data: {"usage":{"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credential.ID: {{status: http.StatusOK, body: responseBody}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
+	captureDirectory := t.TempDir()
+	service.UpdateQualityRetry(QualityRetryRuntime{
+		Enabled: true, MaxAttempts: 1, MinOutputTokens: 32, HoldTimeout: time.Second,
+		Trace: QualityTraceRuntime{
+			CaptureAbnormalRequest:   true,
+			AbnormalRequestDirectory: captureDirectory,
+		},
+	})
+
+	result, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-quality-zero-reasoning", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true,
+		Body: requestBody,
+	})
+	if err != nil {
+		t.Fatalf("zero-reasoning response should be delivered, err=%v", err)
+	}
+	if _, err := io.ReadAll(result.Body); err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{Reported: true, OutputTokens: 2, ReasoningTokens: 0}, "chat-zero-reasoning", "")
+	if err := result.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(captureDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("captured request files = %d, want 1", len(entries))
+	}
+	captured, err := os.ReadFile(filepath.Join(captureDirectory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(captured) != string(requestBody) {
+		t.Fatalf("captured request = %q, want %q", captured, requestBody)
 	}
 }
 

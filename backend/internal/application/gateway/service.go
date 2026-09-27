@@ -1765,9 +1765,15 @@ attemptLoop:
 					lease.Release()
 					break attemptLoop
 				}
-				if holdCfg.Trace.Enabled || holdCfg.MaxOutputTokensPerSecond > 0 {
+				if holdCfg.Trace.Enabled || holdCfg.Trace.CaptureAbnormalRequest || holdCfg.MaxOutputTokensPerSecond > 0 {
 					traceReader = newQualityTraceReadCloser(response.Body, peek.capture, func(capture qualityStreamCapture) {
 						signals := capture.signals()
+						// A completed, reasoning-capable stream whose upstream usage explicitly
+						// reports zero reasoning tokens is retained for exact local replay,
+						// even when its current response was allowed through.
+						if signals.Terminal && capture.state.usage.Reported && capture.state.usage.ReasoningTokens == 0 {
+							captureAbnormalRequest()
+						}
 						highSpeed := signals.Terminal && !signals.ToolCallOnly && holdCfg.MaxOutputTokensPerSecond > 0 && signals.OutputTokensPerSecond > holdCfg.MaxOutputTokensPerSecond
 						if highSpeed {
 							captureAbnormalRequest()

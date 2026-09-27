@@ -26,7 +26,7 @@ func writeAbnormalRequestFile(config abnormalRequestFileCaptureConfig, body []by
 		return "", fmt.Errorf("create abnormal request capture directory: %w", err)
 	}
 	digest := sha256.Sum256(body)
-	name := fmt.Sprintf("quality-withhold-%s-%x.json", time.Now().UTC().Format("20060102T150405.000000000Z"), digest[:8])
+	name := fmt.Sprintf("quality-capture-%s-%x.json", time.Now().UTC().Format("20060102T150405.000000000Z"), digest[:8])
 	path := filepath.Join(directory, name)
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
