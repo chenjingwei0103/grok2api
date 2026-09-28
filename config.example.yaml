@@ -93,6 +93,8 @@ routing:
   reasoningReplayEnabled: true
   reasoningReplayTTL: 1h
   reasoningReplayMaxEntries: 10240
+  # [通常不要修改] 视频创建阶段的最大换号次数。0 继承 maxAttempts；-1 表示不限次数。
+  videoMaxAttempts: 0
   # [按需修改] 按账号隔离上游连接池，适合外部 L4/连接哈希负载均衡；会增加连接数、TLS 握手和文件描述符占用。
   accountIsolatedConnections: false
   # [通常不要修改] 大账号池默认使用有界分段选号；保留完整池回退、额度优先级和原子并发门禁。

@@ -22,6 +22,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
 	"github.com/chenyme/grok2api/backend/internal/domain/model"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
@@ -725,8 +726,8 @@ func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 	service.UpdateMaxAttempts(3)
 	service.UpdateVideoMaxAttempts(0)
 	policy := service.videoAttemptPolicy()
-	if policy.unlimited || policy.limit != 999 {
-		t.Fatalf("legacy zero policy = %#v", policy)
+	if policy.unlimited || policy.limit != 3 {
+		t.Fatalf("inherited zero policy = %#v", policy)
 	}
 	service.UpdateVideoMaxAttempts(-1)
 	policy = service.videoAttemptPolicy()
@@ -737,6 +738,19 @@ func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 	policy = service.videoAttemptPolicy()
 	if policy.unlimited || policy.limit != 5 {
 		t.Fatalf("standalone policy = %#v", policy)
+	}
+}
+
+func TestProxiedWebVideoRateLimitStopsAccountFailover(t *testing.T) {
+	proxied := infraegress.Selection{NodeID: 461, NodeName: "resin-web", Proxied: true}
+	if !shouldStopVideoCreateFailoverOnRateLimit(account.ProviderWeb, proxied, true) {
+		t.Fatal("proxied Web 429 must stop account failover")
+	}
+	if shouldStopVideoCreateFailoverOnRateLimit(account.ProviderWeb, infraegress.Selection{}, false) {
+		t.Fatal("unknown egress must keep the existing account failover behavior")
+	}
+	if shouldStopVideoCreateFailoverOnRateLimit(account.ProviderConsole, proxied, true) {
+		t.Fatal("Console 429 must keep the existing account failover behavior")
 	}
 }
 

@@ -635,6 +635,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		stage, hasStage := provider.VideoErrorStage(err)
 		safeCreateFailure := hasStage && stage == provider.VideoStageCreate
 		status, hasStatus := provider.ErrorHTTPStatus(err)
+		egressSelection, hasEgressSelection := egressTrace.Selection(primaryEgressScope(lease.Credential.Provider))
 		if errors.Is(err, provider.ErrUnauthorized) {
 			if lease.Credential.AuthType == account.AuthTypeSSO {
 				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
@@ -665,6 +666,16 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				}
 				failureHandled = true
 				retriableCreate = safeCreateFailure && !account.IsBuildSuper(lease.Credential, lease.Billing)
+			case status == http.StatusTooManyRequests && shouldStopVideoCreateFailoverOnRateLimit(lease.Credential.Provider, egressSelection, hasEgressSelection):
+				// The Web media endpoint can rate-limit the shared proxy egress while
+				// account video quota remains available. Refresh quota state, but do
+				// not cool a healthy account or fan the same 429 across the pool.
+				if lease.QuotaMode != "" {
+					_, _ = s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
+					s.selector.MarkQuotaStateChanged(lease.Credential.Provider, lease.Credential.ID)
+				}
+				failureHandled = true
+				retriableCreate = false
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
 				state, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
 				s.applyRateLimitReconciliation(failureCtx, lease.Credential, status, 0, state, reconcileErr)
@@ -1312,12 +1323,16 @@ func captureVideoAttempt(recorder *failureAttemptRecorder, credential account.Cr
 
 func (s *Service) videoAttemptPolicy() routingAttemptPolicy {
 	configured := int(s.videoMaxAttempts.Load())
-	// Legacy installs may still have 0 from the short-lived "inherit" default.
-	// Treat it as the general default pool size instead of reintroducing inherit UI.
+	// Zero inherits the normal request budget. This keeps deployments that only
+	// configure routing.maxAttempts from expanding one video 429 across a pool.
 	if configured == 0 {
-		configured = 999
+		configured = int(s.maxAttempts.Load())
 	}
 	return newRoutingAttemptPolicy(configured)
+}
+
+func shouldStopVideoCreateFailoverOnRateLimit(providerValue account.Provider, selection infraegress.Selection, selected bool) bool {
+	return providerValue == account.ProviderWeb && selected && selection.Proxied
 }
 
 func (s *Service) releaseVideoInputs(job media.Job) {

@@ -962,7 +962,7 @@ func defaultConfig() Config {
 			CooldownMax:                 Duration(30 * time.Minute),
 			CapacityWait:                Duration(500 * time.Millisecond),
 			MaxAttempts:                 999,
-			VideoMaxAttempts:            999,
+			VideoMaxAttempts:            0,
 			MarkBuildChatDeniedAsReauth: false,
 			PreferFreeBuild:             false,
 			AccountIsolatedConnections:  false,
