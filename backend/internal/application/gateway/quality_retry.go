@@ -73,6 +73,10 @@ type QualityRetryRuntime struct {
 	// Trace writes bounded, redacted diagnostics for both delivered and
 	// withheld streams that enter this quality hold path.
 	Trace QualityTraceRuntime
+	// requireReasoningAfterRetry is request-local state set after a missing
+	// reasoning retry. It prevents a later pure tool call from masking the
+	// same account-quality failure.
+	requireReasoningAfterRetry bool
 }
 
 // QualityTraceRuntime controls private per-attempt diagnostics. It is kept
@@ -110,6 +114,9 @@ type QualityStreamSignals struct {
 	// call and which contains no user-visible text. Tool arguments are not
 	// ordinary answer text and must not trigger the output-speed guard.
 	ToolCallOnly bool
+	// RequireReasoningAfterRetry is set only after this request has already
+	// retried a response with no reasoning evidence.
+	RequireReasoningAfterRetry bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -292,12 +299,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	// Trust the final upstream usage counter for this temporary comparison.
-	// The speed guard runs before this classifier, so a terminal response above
-	// MaxOutputTokensPerSecond is still withheld and retried.
-	if sig.Terminal && sig.ReasoningTokens > 0 {
-		return QualityDeliver
-	}
+	// Upstream usage.reasoning_tokens is accounting, not reasoning evidence.
+	// Degraded streams can report a large bill without emitting any reasoning
+	// event, so inspect the observed stream before allowing a terminal result.
 	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
 		return QualityWithhold
 	}
@@ -360,7 +364,7 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 // delivered a buffered chunk quickly. The threshold is independent of output
 // length: even a one-token terminal response is retried when it exceeds it.
 func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, maxOutputTokensPerSecond float64) QualityVerdict {
-	if sig.Terminal && sig.ToolCallOnly {
+	if sig.Terminal && sig.ToolCallOnly && !sig.RequireReasoningAfterRetry {
 		return QualityDeliver
 	}
 	if maxOutputTokensPerSecond > 0 && sig.Terminal {
@@ -369,6 +373,10 @@ func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, max
 		}
 	}
 	return ClassifyQualityHold(sig, minOutput)
+}
+
+func qualityRetryNeedsReasoningAfterRetry(sig QualityStreamSignals, verdict QualityVerdict) bool {
+	return verdict == QualityWithhold && !sig.HasThinking
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain

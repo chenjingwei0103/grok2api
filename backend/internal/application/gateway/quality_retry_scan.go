@@ -31,6 +31,7 @@ type qualityScanState struct {
 	aggregateRunes                  int
 	semanticOutput                  bool
 	toolCallSeen                    bool
+	requireReasoningAfterRetry      bool
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
@@ -187,19 +188,20 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	}
 	s.usage.OutputTokensPerSecond = outputTokensPerSecond
 	return QualityStreamSignals{
-		HasThinking:           hasThinking,
-		PlaintextThinking:     s.hasThinking,
-		ReasoningStarted:      s.reasoningStarted || hasThinking,
-		VisibleTokens:         visible,
-		ReasoningTokens:       reasoningTokens,
-		OutputTokens:          output,
-		EncryptedBytes:        s.encryptedBytes,
-		FirstVisible:          firstVisible,
-		VisibleFlushMS:        flushMS,
-		Terminal:              s.terminal,
-		HoldExpired:           s.holdExpired,
-		OutputTokensPerSecond: outputTokensPerSecond,
-		ToolCallOnly:          s.toolCallSeen && visible <= 0,
+		HasThinking:                hasThinking,
+		PlaintextThinking:          s.hasThinking,
+		ReasoningStarted:           s.reasoningStarted || hasThinking,
+		VisibleTokens:              visible,
+		ReasoningTokens:            reasoningTokens,
+		OutputTokens:               output,
+		EncryptedBytes:             s.encryptedBytes,
+		FirstVisible:               firstVisible,
+		VisibleFlushMS:             flushMS,
+		Terminal:                   s.terminal,
+		HoldExpired:                s.holdExpired,
+		OutputTokensPerSecond:      outputTokensPerSecond,
+		ToolCallOnly:               s.toolCallSeen && visible <= 0,
+		RequireReasoningAfterRetry: s.requireReasoningAfterRetry,
 	}
 }
 
@@ -632,6 +634,7 @@ func peekQualityStreamCaptured(ctx context.Context, body io.ReadCloser, protocol
 		protocol:                        protocol,
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
+		requireReasoningAfterRetry:      cfg.requireReasoningAfterRetry,
 		startedAt:                       time.Now(),
 	}
 	if cfg.Trace.Enabled {
@@ -714,6 +717,9 @@ func finishQualityPeekCaptured(held *bytes.Buffer, pump *qualityReadPump, state 
 	signals := state.signals()
 	if !signals.HasThinking && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
 		if state.semanticOutput {
+			if signals.RequireReasoningAfterRetry {
+				return newQualityPeekResult(held, pump, state, QualityWithhold), nil
+			}
 			return newQualityPeekResult(held, pump, state, QualityDeliver), nil
 		}
 		return newQualityPeekResult(held, pump, state, QualityWait), errQualityEmptyStream

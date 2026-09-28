@@ -34,7 +34,7 @@ func TestClassifyQualityHold(t *testing.T) {
 		want QualityVerdict
 	}{
 		{name: "thinking delivers", sig: QualityStreamSignals{HasThinking: true, PlaintextThinking: true, VisibleTokens: 10}, want: QualityDeliver},
-		{name: "usage reasoning tokens alone delivers", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityDeliver},
+		{name: "usage reasoning tokens alone withholds", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityWithhold},
 		{name: "visible 32 no think withhold", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityWithhold},
 		{name: "output 40 no think withhold", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
 		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityDeliver},
@@ -97,6 +97,49 @@ func TestClassifyQualityHoldWithSpeed(t *testing.T) {
 
 	if got := classifyQualityHoldWithSpeed(degraded, 8, 0); got != QualityDeliver {
 		t.Fatalf("disabled speed guard verdict = %s", got)
+	}
+}
+
+func TestQualityRetryNeedsReasoningAfterRetry(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		sig     QualityStreamSignals
+		verdict QualityVerdict
+		want    bool
+	}{
+		{
+			name:    "missing reasoning with zero reported tokens",
+			sig:     QualityStreamSignals{Terminal: true, VisibleTokens: 40},
+			verdict: QualityWithhold,
+			want:    true,
+		},
+		{
+			name:    "usage-only reasoning is not evidence",
+			sig:     QualityStreamSignals{Terminal: true, VisibleTokens: 40, ReasoningTokens: 60},
+			verdict: QualityWithhold,
+			want:    true,
+		},
+		{
+			name:    "actual plaintext reasoning does not escalate tool calls",
+			sig:     QualityStreamSignals{Terminal: true, HasThinking: true, PlaintextThinking: true, VisibleTokens: 40},
+			verdict: QualityWithhold,
+			want:    false,
+		},
+		{
+			name:    "deliver does not escalate",
+			sig:     QualityStreamSignals{Terminal: true, VisibleTokens: 40},
+			verdict: QualityDeliver,
+			want:    false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := qualityRetryNeedsReasoningAfterRetry(test.sig, test.verdict); got != test.want {
+				t.Fatalf("qualityRetryNeedsReasoningAfterRetry() = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -1611,6 +1654,102 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	toolCache.AllowClientToolCacheRoute = true
 	if !shouldHoldQualityStream(toolCache, nil, route, audit.OperationChat, cfg) {
 		t.Fatal("client identity/cache compatibility alone must not disable the hold")
+	}
+}
+
+func TestAttemptLoopQualityHoldRetriesToolOnlyAfterMissingReasoning(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-tool-only-after-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	credentials := make([]accountdomain.Credential, 0, 3)
+	for index, name := range []string{"quality-first-no-think", "quality-tool-only", "quality-retry-thinking"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, accountdomain.Credential{
+			Provider: accountdomain.ProviderBuild, Name: name, SourceKey: name, EncryptedAccessToken: name,
+			EncryptedRefreshToken: "refresh-" + name, ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, accountdomain.ProviderBuild, []string{"grok-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.6"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "quality-tool-only-key", Prefix: "qtool", SecretHash: strings.Repeat("a", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noThink := sse(
+		`data: {"choices":[{"delta":{"content":"`+strings.Repeat("abcd", 40)+`"}}]}`,
+		`data: {"usage":{"completion_tokens":40,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)
+	toolOnly := sse(
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":0}}}`,
+		"data: [DONE]",
+	)
+	thinking := sse(
+		`data: {"choices":[{"delta":{"thinking_content":"inspect the request before calling a tool"}}]}`,
+		`data: {"choices":[{"delta":{"content":"healthy retry answer"}}]}`,
+		`data: {"usage":{"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":40}}}`,
+		"data: [DONE]",
+	)
+	adapter := &scriptedBuildAdapter{responses: map[uint64][]scriptedBuildResponse{
+		credentials[0].ID: {{status: http.StatusOK, body: noThink}},
+		credentials[1].ID: {{status: http.StatusOK, body: toolOnly}},
+		credentials[2].ID: {{status: http.StatusOK, body: thinking}},
+	}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	service.UpdateQualityRetry(QualityRetryRuntime{Enabled: true, MaxAttempts: 3, MinOutputTokens: 32, OnExhausted: qualityRetryFailOpen, HoldTimeout: time.Second})
+
+	result, err := service.CreateChatCompletion(ctx, Input{
+		RequestID: "req-quality-tool-only-after-retry", ClientKey: clientKey, PublicModel: "grok-4.6", Streaming: true,
+		Body: []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"inspect a file"}],"stream":true}`),
+	})
+	if err != nil {
+		t.Fatalf("attempt loop should recover after the tool-only retry, err=%v", err)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{Reported: true, OutputTokens: 80, ReasoningTokens: 40}, "chat-tool-only-retry", "")
+	_ = result.Body.Close()
+	if !strings.Contains(string(body), "healthy retry answer") || !strings.Contains(string(body), "thinking_content") {
+		t.Fatalf("client must receive the reasoning retry, got %s", body)
+	}
+	if strings.Contains(string(body), "read_file") {
+		t.Fatalf("tool-only zero-reasoning retry must not be delivered: %s", body)
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
+		t.Fatalf("expected missing-thinking and tool-only retries before delivery, attempts=%#v", attempts)
 	}
 }
 

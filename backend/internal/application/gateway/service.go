@@ -1061,6 +1061,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
+	qualityRetryAfterMissingReasoning := false
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	selection := preselectedSession
@@ -1642,7 +1643,9 @@ attemptLoop:
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if qualityHoldEnabled {
-				peek, peekErr := peekQualityStreamCaptured(ctx, response.Body, qualityProtocolForOperation(operation), holdCfg)
+				attemptHoldCfg := holdCfg
+				attemptHoldCfg.requireReasoningAfterRetry = qualityRetryAfterMissingReasoning
+				peek, peekErr := peekQualityStreamCaptured(ctx, response.Body, qualityProtocolForOperation(operation), attemptHoldCfg)
 				if peekErr != nil {
 					if holdCfg.Trace.Enabled {
 						failureAttempts.captureQualityTrace(credential, responseStartedAt, qualityTraceAttemptInput{
@@ -1691,6 +1694,9 @@ attemptLoop:
 					hasNextAccount = false
 				}
 				commit := CommitQualityHold(peek.verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+				if commit.Action == QualityActionRetry && qualityRetryNeedsReasoningAfterRetry(peek.capture.signals(), peek.verdict) {
+					qualityRetryAfterMissingReasoning = true
+				}
 				traceInput := qualityTraceAttemptInput{
 					Request: qualityRequestTrace, RequestID: input.RequestID, RequestPath: path,
 					PublicModel: input.PublicModel, UpstreamModel: route.UpstreamModel, Provider: string(route.Provider), Operation: operation,
