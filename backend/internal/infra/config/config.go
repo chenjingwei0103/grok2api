@@ -321,6 +321,11 @@ type QualityGuardRequestRetryTraceConfig struct {
 	OutputMaxBytes           int    `yaml:"outputMaxBytes"`
 	CaptureAbnormalRequest   bool   `yaml:"captureAbnormalRequest"`
 	AbnormalRequestDirectory string `yaml:"abnormalRequestDirectory"`
+	// CaptureAllRequests archives complete local replay bundles for every
+	// delivered request that enters the quality hold path. Keep this opt-in:
+	// bundles contain user request/response content and are not audit records.
+	CaptureAllRequests  bool   `yaml:"captureAllRequests"`
+	AllRequestDirectory string `yaml:"allRequestDirectory"`
 }
 
 type ClientKeyDefaultsConfig struct {

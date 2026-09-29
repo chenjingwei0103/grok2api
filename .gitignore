@@ -50,3 +50,4 @@ __pycache__/
 /.tmp/
 /tmp/
 /Dockerfile.local
+.ace-tool/

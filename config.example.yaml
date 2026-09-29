@@ -188,3 +188,7 @@ qualityGuard:
       enabled: false
       inputMaxBytes: 4096
       outputMaxBytes: 8192
+      # Local-only: retain complete request and upstream SSE bundles for replay.
+      # These files include user content; keep this disabled in cloud deployments.
+      captureAllRequests: false
+      allRequestDirectory: data/conversation-captures

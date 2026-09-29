@@ -69,12 +69,14 @@ func TestSSOBuildFlowMapsDeadSSOToUnauthorized(t *testing.T) {
 	}
 }
 
-func TestSSOBuildFlowUsesAuthEndpointsOnly(t *testing.T) {
+func TestSSOBuildFlowUsesConsentToken(t *testing.T) {
+	consent := `<form action="https://auth.x.ai/oauth2/device/approve" method="POST"><input type="hidden" name="user_code" value="uc"/><input type="hidden" name="principal_type" value="User"/><input type="hidden" name="principal_id" value=""/><input type="hidden" name="consent_token" value="consent-secret"/></form>`
 	client := &scriptedSSOClient{responses: []*http.Response{
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
 			`{"device_code":"dc","user_code":"uc","interval":1,"expires_in":1800}`))},
 		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent"}}, Body: io.NopCloser(strings.NewReader(""))},
-		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(consent))},
+		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://auth.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
 			`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`))},
 	}}
@@ -83,13 +85,19 @@ func TestSSOBuildFlowUsesAuthEndpointsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seed.AccessToken != "access" || seed.RefreshToken != "refresh" || len(client.requests) != 4 {
+	if seed.AccessToken != "access" || seed.RefreshToken != "refresh" || len(client.requests) != 5 {
 		t.Fatalf("seed=%#v requests=%d", seed, len(client.requests))
 	}
-	for _, request := range client.requests {
-		if request.URL.Hostname() != "auth.x.ai" {
-			t.Fatalf("device flow visited unexpected host %q", request.URL.Hostname())
-		}
+	if client.requests[2].URL.Host != "accounts.x.ai" || client.requests[2].Method != http.MethodGet {
+		t.Fatalf("consent request = %s %s", client.requests[2].Method, client.requests[2].URL)
+	}
+	approve := client.requests[3]
+	if approve.URL.Host != "auth.x.ai" || approve.Header.Get("Origin") != "https://accounts.x.ai" {
+		t.Fatalf("approve = %s origin %q", approve.URL, approve.Header.Get("Origin"))
+	}
+	body, _ := io.ReadAll(approve.Body)
+	if !strings.Contains(string(body), "consent_token=consent-secret") {
+		t.Fatalf("approve body = %q", body)
 	}
 }
 

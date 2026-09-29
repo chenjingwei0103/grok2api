@@ -507,6 +507,8 @@ func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.Qu
 			OutputMaxBytes:           value.Trace.OutputMaxBytes,
 			CaptureAbnormalRequest:   value.Trace.CaptureAbnormalRequest,
 			AbnormalRequestDirectory: value.Trace.AbnormalRequestDirectory,
+			CaptureAllRequests:       value.Trace.CaptureAllRequests,
+			AllRequestDirectory:      value.Trace.AllRequestDirectory,
 		},
 	}
 }

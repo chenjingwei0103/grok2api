@@ -88,6 +88,8 @@ type QualityTraceRuntime struct {
 	OutputMaxBytes           int
 	CaptureAbnormalRequest   bool
 	AbnormalRequestDirectory string
+	CaptureAllRequests       bool
+	AllRequestDirectory      string
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this

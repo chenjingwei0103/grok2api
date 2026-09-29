@@ -1227,6 +1227,12 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			})
 		}
 		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
+		if directory, finish := startConversationCapture(conversationCaptureConfig{
+			Enabled: holdCfg.Trace.CaptureAllRequests, Directory: holdCfg.Trace.AllRequestDirectory,
+		}, input.RequestID, input.Method, input.Path, input.Body); directory != "" {
+			response.Body = newConversationCaptureReadCloser(response.Body, directory, finish)
+			s.logger.Info("conversation_capture_started", "request_id", input.RequestID, "directory", directory)
+		}
 		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
 			failureAttempts.captureStreamFailure(credential, upstreamStartedAt, response, diagnostic)
 		}

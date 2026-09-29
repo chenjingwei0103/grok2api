@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"golang.org/x/net/html"
 )
 
 const (
@@ -101,9 +103,9 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 		device.ExpiresIn = 1800
 	}
 
-	// verify/approve 已在 auth.x.ai 完成状态变更。重定向目标只是结果页，
-	// 因此不访问 accounts.x.ai，直接解析首个 3xx Location 的状态路径。
-	status, finalURL, _, err := f.doWithFollow(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}}, false)
+	// verify 只确认重定向到同意页。同意页在 accounts.x.ai，批准请求必须带上页面里的
+	// consent_token，并且 Origin 要是该页的来源，否则 auth.x.ai 会回 403。
+	status, consentURL, _, err := f.doWithFollow(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}}, false)
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
@@ -113,15 +115,37 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	if status < 200 || status >= 400 {
 		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
 	}
-	if redirectState := ssoDeviceRedirectState(finalURL); redirectState != "consent" {
+	if redirectState := ssoDeviceRedirectState(consentURL); redirectState != "consent" {
 		if redirectState == "sign-in" {
 			return provider.CredentialSeed{}, provider.ErrUnauthorized
 		}
 		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
 	}
-	status, finalURL, _, err = f.doWithFollow(ctx, http.MethodPost, ssoApproveURL, url.Values{
-		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
-	}, false)
+	status, _, consentBody, err := f.doWithHeaders(ctx, http.MethodGet, consentURL, nil, true, http.Header{
+		"Accept": {"text/html,application/xhtml+xml"}, "Referer": {ssoVerifyURL},
+	})
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	if status < 200 || status >= 300 {
+		return provider.CredentialSeed{}, fmt.Errorf("读取 Device Flow 同意页失败: %w", conversionHTTPError{status: status})
+	}
+	fields, approveURL, err := parseDeviceConsent(consentBody)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	if !safeXAIURL(approveURL) {
+		return provider.CredentialSeed{}, fmt.Errorf("Device Flow 同意页提交地址不可信")
+	}
+	status, finalURL, _, err := f.doWithHeaders(ctx, http.MethodPost, approveURL, url.Values{
+		"user_code":      {firstValue(fields.Get("user_code"), device.UserCode)},
+		"action":         {"allow"},
+		"principal_type": {firstValue(fields.Get("principal_type"), "User")},
+		"principal_id":   {fields.Get("principal_id")},
+		"consent_token":  {fields.Get("consent_token")},
+	}, false, http.Header{
+		"Origin": {consentOrigin(consentURL)}, "Referer": {consentURL},
+	})
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
@@ -217,12 +241,16 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 }
 
 func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url.Values) (int, string, []byte, error) {
-	return f.doWithFollow(ctx, method, endpoint, form, true)
+	return f.doWithHeaders(ctx, method, endpoint, form, true, nil)
+}
+
+func (f *ssoBuildFlow) doWithFollow(ctx context.Context, method, endpoint string, form url.Values, follow bool) (int, string, []byte, error) {
+	return f.doWithHeaders(ctx, method, endpoint, form, follow, nil)
 }
 
 // doWithFollow 在 follow=false 时遇到 3xx 直接返回状态码与解析后的 Location 作为 finalURL，
 // 用于重定向目标域会被 Cloudflare 拦截（accounts.x.ai）的请求。
-func (f *ssoBuildFlow) doWithFollow(ctx context.Context, method, endpoint string, form url.Values, follow bool) (int, string, []byte, error) {
+func (f *ssoBuildFlow) doWithHeaders(ctx context.Context, method, endpoint string, form url.Values, follow bool, extra http.Header) (int, string, []byte, error) {
 	if !safeXAIURL(endpoint) {
 		return 0, "", nil, fmt.Errorf("xAI OAuth URL 不安全")
 	}
@@ -244,6 +272,15 @@ func (f *ssoBuildFlow) doWithFollow(ctx context.Context, method, endpoint string
 		request.Header.Set("Cookie", f.cookieHeader())
 		if currentForm != nil {
 			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		for key, values := range extra {
+			if strings.EqualFold(key, "Cookie") || strings.EqualFold(key, "Host") {
+				continue
+			}
+			request.Header.Del(key)
+			for _, value := range values {
+				request.Header.Add(key, value)
+			}
 		}
 		response, err := f.client.Do(request)
 		if err != nil {
@@ -298,6 +335,68 @@ func (f *ssoBuildFlow) captureCookies(response *http.Response) {
 		}
 		f.cookies[name] = value
 	}
+}
+
+func parseDeviceConsent(body []byte) (url.Values, string, error) {
+	fields := url.Values{}
+	action := ""
+	tokenizer := html.NewTokenizer(bytes.NewReader(body))
+	for {
+		switch tokenizer.Next() {
+		case html.ErrorToken:
+			if fields.Get("consent_token") == "" {
+				return nil, "", fmt.Errorf("同意页缺少 consent_token")
+			}
+			if action == "" {
+				action = ssoApproveURL
+			}
+			return fields, action, nil
+		case html.StartTagToken, html.SelfClosingTagToken:
+			name, hasAttr := tokenizer.TagName()
+			switch string(name) {
+			case "form":
+				for {
+					key, value, more := tokenizer.TagAttr()
+					if string(key) == "action" && strings.Contains(string(value), "/oauth2/device/approve") {
+						action = string(value)
+					}
+					if !more {
+						break
+					}
+				}
+			case "input":
+				if !hasAttr {
+					continue
+				}
+				var typ, key, value string
+				for {
+					attrKey, attrValue, more := tokenizer.TagAttr()
+					switch string(attrKey) {
+					case "type":
+						typ = string(attrValue)
+					case "name":
+						key = string(attrValue)
+					case "value":
+						value = string(attrValue)
+					}
+					if !more {
+						break
+					}
+				}
+				if strings.EqualFold(typ, "hidden") && key != "" {
+					fields.Set(key, value)
+				}
+			}
+		}
+	}
+}
+
+func consentOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "https://accounts.x.ai"
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 func ssoDeviceRedirectState(raw string) string {
