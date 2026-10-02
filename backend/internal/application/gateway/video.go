@@ -535,6 +535,14 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, "/videos/generations")
 	var selection *selectionSession
 	var lease *accountLease
+	// Failure exits can happen after a lease is acquired but before the success
+	// finalizer below. Keep the release paired with the acquisition across all
+	// return paths.
+	defer func() {
+		if lease != nil {
+			lease.Release()
+		}
+	}()
 	var result provider.VideoResult
 	var lastErr error
 
@@ -650,14 +658,14 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				retriableCreate = safeCreateFailure
 			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
 				// Web anti-bot 403 is egress-scoped. Retry the same account once so
-				// egress invalidation can rebuild the route, then move on normally.
+				// egress invalidation can rebuild the route. A second 403 is still
+				// egress-scoped, so it must not fan the same rejection across the
+				// account pool.
 				failureHandled = true
-				if safeCreateFailure {
-					if !forbiddenEgressRetried[lease.Credential.ID] {
-						forbiddenEgressRetried[lease.Credential.ID] = true
-						retryPinnedAccountID = lease.Credential.ID
-						delete(excluded, lease.Credential.ID)
-					}
+				if safeCreateFailure && !forbiddenEgressRetried[lease.Credential.ID] {
+					forbiddenEgressRetried[lease.Credential.ID] = true
+					retryPinnedAccountID = lease.Credential.ID
+					delete(excluded, lease.Credential.ID)
 					retriableCreate = true
 				}
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
@@ -726,7 +734,6 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		s.failVideoJob(parent, job, "account_unavailable", ErrNoAvailableAccount, 0, failureAttempts.snapshot())
 		return
 	}
-	defer lease.Release()
 
 	// Provider 已消费请求体，尽早释放 Base64 物化名额和大字符串。
 	referenceURLs = nil
