@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -277,6 +278,9 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
+	if err := a.prepareVideoImagineSession(ctx, cfg, lease, token, firstFrameAsset, referenceAssets); err != nil {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
+	}
 	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0], firstFrameAsset, referenceAssets)
 	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
 	if err != nil {
@@ -300,6 +304,73 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	return result, nil
 }
 
+// prepareVideoImagineSession mirrors the browser's asset visibility checks after
+// an Imagine upload and before creating an image-conditioned video request.
+func (a *Adapter) prepareVideoImagineSession(ctx context.Context, cfg Config, lease *infraegress.Lease, token, firstFrameAsset string, referenceAssets []string) error {
+	assets := make([]string, 0, len(referenceAssets)+1)
+	if firstFrameAsset != "" {
+		assets = append(assets, firstFrameAsset)
+	}
+	assets = append(assets, referenceAssets...)
+	if len(assets) == 0 {
+		return nil
+	}
+	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/media/collection/list", map[string]any{"limit": 100}, time.Duration(cfg.VideoTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
+	if err != nil {
+		return fmt.Errorf("初始化 Imagine 媒体集合: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		upstreamErr := readWebMediaUpstreamError(response)
+		_ = response.Body.Close()
+		return upstreamErr
+	}
+	_ = response.Body.Close()
+	for _, assetID := range assets {
+		if err := a.confirmVideoImagineAsset(ctx, cfg, lease, token, assetID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *Adapter) confirmVideoImagineAsset(ctx context.Context, cfg Config, lease *infraegress.Lease, token, assetID string) error {
+	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, cfg.BaseURL+"/rest/assets/"+url.PathEscape(assetID), nil)
+	if err != nil {
+		return err
+	}
+	request.Header = buildHeaders(token, lease, "")
+	request.Header.Del("Content-Type")
+	applyAppHeaders(request.Header, cfg.BaseURL, cfg.BaseURL+"/imagine")
+	a.applySignedStatsig(requestCtx, request, token, lease)
+	response, err := lease.DoDeferredForbidden(request)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		upstreamErr := readWebMediaUpstreamError(response)
+		_ = response.Body.Close()
+		return upstreamErr
+	}
+	_ = response.Body.Close()
+	return nil
+}
+
+func readWebMediaUpstreamError(response *http.Response) error {
+	if response == nil {
+		return errors.New("Grok Web 返回空响应")
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, webMediaDiagnosticBodyLimit+1))
+	if err != nil {
+		return fmt.Errorf("读取 Grok Web 错误响应: %w", err)
+	}
+	truncated := len(body) > webMediaDiagnosticBodyLimit
+	if truncated {
+		body = body[:webMediaDiagnosticBodyLimit]
+	}
+	return newWebMediaUpstreamError(response.StatusCode, body, truncated)
+}
 func (a *Adapter) uploadVideoReferenceAssets(ctx context.Context, cfg Config, lease *infraegress.Lease, token string, request provider.VideoRequest) (string, []string, error) {
 	upload := func(rawURL, stage string) (string, error) {
 		image, err := a.loadChatImage(ctx, lease, rawURL, cfg.MaxInputImageBytes)
@@ -571,16 +642,18 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int, firstFram
 			"prompt": prompt, "aspectRatio": ratio, "duration": seconds, "resolutionName": resolution,
 		}
 	} else {
-		// The captured Grok Imagine reference-to-video request derives framing
-		// from its uploaded assets and omits aspectRatio. Keep this wire shape
-		// separate from textToVideo, which accepts an explicit aspect ratio.
-		referenceToVideo := map[string]any{
-			"prompt": prompt, "inputAssets": referenceAssets, "duration": seconds, "resolutionName": resolution,
-		}
+		// Grok Imagine now uses imageToVideo for every image-conditioned
+		// generation. The first frame and reference images are represented by
+		// their upload order in inputAssets rather than a separate field.
+		inputAssets := make([]string, 0, len(referenceAssets)+1)
 		if firstFrameAsset != "" {
-			referenceToVideo["firstFrameAsset"] = firstFrameAsset
+			inputAssets = append(inputAssets, firstFrameAsset)
 		}
-		mediaGenInput["referenceToVideo"] = referenceToVideo
+		inputAssets = append(inputAssets, referenceAssets...)
+		mediaGenInput["imageToVideo"] = map[string]any{
+			"prompt": prompt, "inputAssets": inputAssets, "aspectRatio": ratio,
+			"duration": seconds, "resolutionName": resolution, "mode": "custom",
+		}
 	}
 	return map[string]any{
 		"modelName":            "imagine-video-gen",
