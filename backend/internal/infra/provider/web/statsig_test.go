@@ -29,6 +29,166 @@ func TestExtractStatsigMetaContentAcceptsCurrentMetaName(t *testing.T) {
 	}
 }
 
+func TestFetchStatsigMetaContentFallsBackToRootWhenIndexHasNoVerification(t *testing.T) {
+	var paths []string
+	do := func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		switch request.URL.Path {
+		case "/index":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader(`<html><head><meta name="robots" content="noindex"/></head></html>`)),
+				Header:     http.Header{},
+			}, nil
+		case "/":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`<html><head><meta name="grok-site-verification" content="root-meta"/></head></html>`)),
+				Header:     http.Header{},
+			}, nil
+		default:
+			t.Fatalf("unexpected path %q", request.URL.Path)
+			return nil, nil
+		}
+	}
+
+	value, err := fetchStatsigMetaContentWithDo(
+		context.Background(),
+		"https://grok.com",
+		"sso-token",
+		&infraegress.Lease{UserAgent: "test-agent"},
+		do,
+	)
+	if err != nil || value != "root-meta" {
+		t.Fatalf("value=%q err=%v paths=%v", value, err, paths)
+	}
+	if len(paths) != 2 || paths[0] != "/index" || paths[1] != "/" {
+		t.Fatalf("paths=%v", paths)
+	}
+}
+
+func TestFetchStatsigMetaContentDoesNotFallbackWhenIndex404HasVerification(t *testing.T) {
+	var paths []string
+	do := func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		if request.URL.Path != "/index" {
+			t.Fatalf("unexpected fallback to %q", request.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Body:       io.NopCloser(strings.NewReader(`<html><head><meta name="grok-site-verification" content="index-meta"/></head></html>`)),
+			Header:     http.Header{},
+		}, nil
+	}
+
+	value, err := fetchStatsigMetaContentWithDo(
+		context.Background(),
+		"https://grok.com",
+		"sso-token",
+		&infraegress.Lease{UserAgent: "test-agent"},
+		do,
+	)
+	if err != nil || value != "index-meta" {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+	if len(paths) != 1 || paths[0] != "/index" {
+		t.Fatalf("paths=%v", paths)
+	}
+}
+
+func TestFetchStatsigMetaContentDoesNotFallbackWhenSuccessfulIndexHasNoVerification(t *testing.T) {
+	var paths []string
+	do := func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`<html><head></head></html>`)),
+			Header:     http.Header{},
+		}, nil
+	}
+
+	_, err := fetchStatsigMetaContentWithDo(
+		context.Background(),
+		"https://grok.com",
+		"sso-token",
+		&infraegress.Lease{UserAgent: "test-agent"},
+		do,
+	)
+	if !errors.Is(err, errStatsigMetaMissing) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(paths) != 1 || paths[0] != "/index" {
+		t.Fatalf("successful index without verification must not fall back: paths=%v", paths)
+	}
+}
+
+func TestFetchStatsigMetaContentRejectsNon404IndexStatuses(t *testing.T) {
+	for _, status := range []int{
+		http.StatusMovedPermanently,
+		http.StatusForbidden,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusServiceUnavailable,
+	} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			var calls int
+			do := func(request *http.Request) (*http.Response, error) {
+				calls++
+				if request.URL.Path != "/index" {
+					t.Fatalf("unexpected fallback to %q", request.URL.Path)
+				}
+				return &http.Response{
+					StatusCode: status,
+					Body:       io.NopCloser(strings.NewReader(`<html><head></head></html>`)),
+					Header:     http.Header{},
+				}, nil
+			}
+
+			_, err := fetchStatsigMetaContentWithDo(
+				context.Background(),
+				"https://grok.com",
+				"sso-token",
+				&infraegress.Lease{UserAgent: "test-agent"},
+				do,
+			)
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("Grok index 返回 %d", status)) {
+				t.Fatalf("err=%v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("calls=%d", calls)
+			}
+		})
+	}
+}
+
+func TestFetchStatsigMetaContentRequiresSuccessfulRoot(t *testing.T) {
+	do := func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/index" {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader(`<html><head></head></html>`)),
+				Header:     http.Header{},
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       io.NopCloser(strings.NewReader(`<html><head><meta name="grok-site-verification" content="root-error-meta"/></head></html>`)),
+			Header:     http.Header{},
+		}, nil
+	}
+
+	_, err := fetchStatsigMetaContentWithDo(
+		context.Background(),
+		"https://grok.com",
+		"sso-token",
+		&infraegress.Lease{UserAgent: "test-agent"},
+		do,
+	)
+	if err == nil || !strings.Contains(err.Error(), "Grok 首页返回 503") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestStatsigSignerSendsMethodPathAndMetaContent(t *testing.T) {
 	raw := make([]byte, 70)
 	encoded := base64.RawStdEncoding.EncodeToString(raw)
