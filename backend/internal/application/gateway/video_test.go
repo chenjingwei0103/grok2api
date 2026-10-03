@@ -741,10 +741,29 @@ func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 	}
 }
 
-func TestProxiedWebVideoRateLimitStopsAccountFailover(t *testing.T) {
+func TestLimitedVideoAccountSwitchStopsAtThreeAccounts(t *testing.T) {
+	policy := newRoutingAttemptPolicy(999)
+	if !videoCreateCanSwitchAccount(policy, 0, true) || !videoCreateCanSwitchAccount(policy, 1, true) {
+		t.Fatal("the first two limited failures must be allowed to switch")
+	}
+	if videoCreateCanSwitchAccount(policy, 2, true) {
+		t.Fatal("a limited failure must stop after three accounts")
+	}
+	if !videoCreateCanSwitchAccount(policy, 2, false) {
+		t.Fatal("ordinary failover must retain the configured attempt budget")
+	}
+	if !isReloadRequiredMediaError(errors.New("Grok Web media upstream returned 403: 7: This page is out of date. Reload to continue.")) {
+		t.Fatal("page reload rejection must be recognized")
+	}
+	if isReloadRequiredMediaError(errors.New("content moderated")) {
+		t.Fatal("unrelated media error must not use the limited account switch")
+	}
+}
+
+func TestProxiedWebVideoRateLimitUsesLimitedAccountFailover(t *testing.T) {
 	proxied := infraegress.Selection{NodeID: 461, NodeName: "resin-web", Proxied: true}
 	if !shouldStopVideoCreateFailoverOnRateLimit(account.ProviderWeb, proxied, true) {
-		t.Fatal("proxied Web 429 must stop account failover")
+		t.Fatal("proxied Web 429 must use the limited account failover")
 	}
 	if shouldStopVideoCreateFailoverOnRateLimit(account.ProviderWeb, infraegress.Selection{}, false) {
 		t.Fatal("unknown egress must keep the existing account failover behavior")

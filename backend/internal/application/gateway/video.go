@@ -640,6 +640,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
 		retriableCreate := false
+		limitedAccountSwitch := false
 		stage, hasStage := provider.VideoErrorStage(err)
 		safeCreateFailure := hasStage && stage == provider.VideoStageCreate
 		status, hasStatus := provider.ErrorHTTPStatus(err)
@@ -658,15 +659,19 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				retriableCreate = safeCreateFailure
 			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
 				// Web anti-bot 403 is egress-scoped. Retry the same account once so
-				// egress invalidation can rebuild the route. A second 403 is still
-				// egress-scoped, so it must not fan the same rejection across the
-				// account pool.
+				// Statsig or egress invalidation can rebuild the route. A repeated
+				// page-state rejection can then move to a bounded set of accounts;
+				// other 403s remain egress-scoped and must not fan across the pool.
 				failureHandled = true
 				if safeCreateFailure && !forbiddenEgressRetried[lease.Credential.ID] {
 					forbiddenEgressRetried[lease.Credential.ID] = true
 					retryPinnedAccountID = lease.Credential.ID
 					delete(excluded, lease.Credential.ID)
 					retriableCreate = true
+				} else if safeCreateFailure && isReloadRequiredMediaError(err) {
+					retryPinnedAccountID = 0
+					retriableCreate = true
+					limitedAccountSwitch = true
 				}
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
 				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
@@ -675,15 +680,16 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				failureHandled = true
 				retriableCreate = safeCreateFailure && !account.IsBuildSuper(lease.Credential, lease.Billing)
 			case status == http.StatusTooManyRequests && shouldStopVideoCreateFailoverOnRateLimit(lease.Credential.Provider, egressSelection, hasEgressSelection):
-				// The Web media endpoint can rate-limit the shared proxy egress while
-				// account video quota remains available. Refresh quota state, but do
-				// not cool a healthy account or fan the same 429 across the pool.
+				// A shared proxy can return 429 even when the selected account still
+				// has video quota. Refresh the account state without cooling it, then
+				// try only a small number of other accounts before failing the job.
 				if lease.QuotaMode != "" {
 					_, _ = s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
 					s.selector.MarkQuotaStateChanged(lease.Credential.Provider, lease.Credential.ID)
 				}
 				failureHandled = true
-				retriableCreate = false
+				retriableCreate = safeCreateFailure
+				limitedAccountSwitch = safeCreateFailure
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
 				state, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
 				s.applyRateLimitReconciliation(failureCtx, lease.Credential, status, 0, state, reconcileErr)
@@ -713,7 +719,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		s.logVideoGenerationFailure(job, lease.Credential, err)
 
 		// Poll/post-processing failures are bound to the already-created upstream job.
-		if provider.IsMediaPostProcessingError(err) || (hasStage && stage == provider.VideoStagePoll) || !retriableCreate || !attemptPolicy.hasNext(attempt) {
+		if provider.IsMediaPostProcessingError(err) || (hasStage && stage == provider.VideoStagePoll) || !retriableCreate || !videoCreateCanSwitchAccount(attemptPolicy, attempt, limitedAccountSwitch) {
 			failureCode, publicErr := "generation_failed", err
 			upstreamStatus := 0
 			if hasStatus {
@@ -1340,6 +1346,23 @@ func (s *Service) videoAttemptPolicy() routingAttemptPolicy {
 
 func shouldStopVideoCreateFailoverOnRateLimit(providerValue account.Provider, selection infraegress.Selection, selected bool) bool {
 	return providerValue == account.ProviderWeb && selected && selection.Proxied
+}
+
+const limitedVideoAccountSwitches = 3
+
+func videoCreateCanSwitchAccount(policy routingAttemptPolicy, attempt int, limited bool) bool {
+	if !policy.hasNext(attempt) {
+		return false
+	}
+	if limited && attempt+1 >= limitedVideoAccountSwitches {
+		return false
+	}
+	return true
+}
+
+func isReloadRequiredMediaError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "page is out of date") || strings.Contains(message, "reload to continue")
 }
 
 func (s *Service) releaseVideoInputs(job media.Job) {
