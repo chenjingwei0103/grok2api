@@ -312,6 +312,7 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "Chat Completions 请求缺少有效 model")
 		return
 	}
+	body = stripAutomationUpdateTools(body)
 	clientValue, exists := c.Get(middleware.ClientKey)
 	clientKey, ok := clientValue.(clientkeydomain.Key)
 	if !exists || !ok {
@@ -1145,6 +1146,7 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		}
 		request.Stream = false
 	}
+	body = stripAutomationUpdateTools(body)
 	clientValue, exists := c.Get(middleware.ClientKey)
 	clientKey, ok := clientValue.(clientkeydomain.Key)
 	if !exists || !ok {
