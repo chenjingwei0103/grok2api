@@ -281,6 +281,12 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 		if requestErr != nil || requestUUID.Version() != uuid.Version(4) || agentErr != nil || agentUUID.Version() != uuid.Version(4) || sessionID != expectedSessionID || r.Header.Get("x-grok-conv-id") != sessionID {
 			t.Fatalf("client identity headers = %#v", r.Header)
 		}
+		if got := r.Header.Get("x-grok-conv-group-id"); got != grokConversationGroupID(sessionID) {
+			t.Fatalf("conv-group-id = %q", got)
+		}
+		if r.Header.Get("x-grok-doom-loop-check") != "1024" || r.Header.Get("x-grok-exact-repetition-check") != "64" || r.Header.Get("x-compactions-remaining") != "1" || r.Header.Get("x-compaction-at") != "400000" {
+			t.Fatalf("cli fidelity headers = %#v", r.Header)
+		}
 		for _, legacy := range []string{"x-grok-client-surface", "x-grok-client-name", "x-grok-conversation-id", "x-grok-session-id-legacy", "x-grok-request-id"} {
 			if r.Header.Get(legacy) != "" {
 				t.Fatalf("legacy header %s = %q", legacy, r.Header.Get(legacy))

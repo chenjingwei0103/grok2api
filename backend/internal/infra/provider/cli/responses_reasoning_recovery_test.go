@@ -351,13 +351,10 @@ func TestRecoverReasoningDecodeFailureWithMillionTokenScaleCompactionBlob(t *tes
 	var calls atomic.Int32
 	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		call := calls.Add(1)
-		data, readErr := io.ReadAll(request.Body)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
+		data := readUpstreamRequestBody(t, request)
 		switch call {
 		case 1:
-			if len(data) < 4<<20 || !strings.Contains(string(data), `"encrypted_content"`) {
+			if request.Header.Get("Content-Encoding") != "zstd" || len(data) < 4<<20 || !strings.Contains(string(data), `"encrypted_content"`) {
 				t.Fatalf("初始 1M 级 compaction 请求不完整：size=%d", len(data))
 			}
 			return jsonHTTPResponse(request, http.StatusBadRequest, `{"error":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}`), nil

@@ -358,13 +358,10 @@ func TestGatewayCompactionLifecycleWithMillionTokenScaleHistory(t *testing.T) {
 	var calls atomic.Int32
 	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		call := calls.Add(1)
-		data, readErr := io.ReadAll(request.Body)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
+		data := readUpstreamRequestBody(t, request)
 		switch call {
 		case 1:
-			if len(data) < 4<<20 || strings.Contains(string(data), "compaction_trigger") {
+			if request.Header.Get("Content-Encoding") != "zstd" || len(data) < 4<<20 || strings.Contains(string(data), "compaction_trigger") {
 				t.Fatalf("压缩采样未携带完整超长历史：size=%d", len(data))
 			}
 			return sseResponse(http.StatusOK, compactionSampleSSE("resp_million", summary), request), nil

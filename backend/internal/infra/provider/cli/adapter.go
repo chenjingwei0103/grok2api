@@ -528,10 +528,6 @@ func isCompactPath(path string) bool {
 }
 
 func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (*http.Response, string, error) {
-	var bodyReader io.Reader
-	if len(body) > 0 {
-		bodyReader = bytes.NewReader(body)
-	}
 	requestCtx := infraegress.WithCredential(ctx, request.Credential)
 	if request.ForcedEgressNodeID != 0 {
 		requestCtx = infraegress.WithEgressNode(requestCtx, request.ForcedEgressNodeID)
@@ -539,6 +535,11 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 	plane := "build"
 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
 		plane = "xai"
+	}
+	outbound, contentEncoding := compressBuildPlaneRequest(plane, body)
+	var bodyReader io.Reader
+	if len(outbound) > 0 {
+		bodyReader = bytes.NewReader(outbound)
 	}
 	requestCtx = infraegress.WithPhysicalCallPlane(requestCtx, plane)
 	req, err := http.NewRequestWithContext(requestCtx, request.Method, a.urlWithBase(base, request.Path), bodyReader)
@@ -548,7 +549,10 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
 		return nil, "", err
 	}
-	applyGrokTurnIndexHeader(req, request.GrokTurnIndex)
+	applyGrokTurnIndexHeader(req, grokTurnIndexForRequest(request.GrokTurnIndex, req.Header.Get("x-grok-session-id"), body))
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
+	}
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -962,10 +966,12 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 		if sessionID != "" {
 			req.Header.Set("x-grok-session-id", sessionID)
 			req.Header.Set("x-grok-conv-id", sessionID)
+			req.Header.Set("x-grok-conv-group-id", grokConversationGroupID(sessionID))
 		}
 		req.Header.Set("x-grok-req-id", requestID)
-		// The gateway cannot reliably recover the CLI prompt index from a stateless API request.
-		// The field is optional in the official protocol, so do not fabricate x-grok-turn-idx.
+		applyGrokCLIFidelityHeaders(req.Header)
+		// An explicit client turn still wins. A stable session without one gets
+		// the user-turn count later; stateless requests stay without a turn index.
 		if credential.UserID != "" {
 			req.Header.Set("x-grok-user-id", credential.UserID)
 		}
