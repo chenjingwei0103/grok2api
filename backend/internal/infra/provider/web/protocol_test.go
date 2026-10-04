@@ -1539,7 +1539,7 @@ func TestParseVideoStreamFixture(t *testing.T) {
 		`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}` + "\n"
 	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
 	progress := 0
-	result, postID, err := parseVideoStream(response, func(value int) { progress = value })
+	result, postID, _, err := parseVideoStream(response, func(value int) { progress = value })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1649,7 +1649,7 @@ func TestGenerateVideoUploadsReferenceImagesAndUsesImageToVideo(t *testing.T) {
 				t.Errorf("imageToVideo = %#v", imageToVideo)
 			}
 			writer.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(writer, `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
+			_, _ = io.WriteString(writer, `data: {"result":{"response":{"userResponse":{"fileAttachments":["reference-1"]}}}}`+"\n"+`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
 		default:
 			http.NotFound(writer, request)
 		}
@@ -1685,6 +1685,63 @@ func TestGenerateVideoUploadsReferenceImagesAndUsesImageToVideo(t *testing.T) {
 	}
 	if !slices.Equal(sequence, wantSequence) {
 		t.Fatalf("request sequence = %#v, want %#v", sequence, wantSequence)
+	}
+}
+
+func TestGenerateVideoRejectsUnboundReferenceImage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/http/upload-file-v2/direct":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"fileMetadata":{"fileMetadataId":"reference-1"}}`)
+		case "/rest/media/collection/list":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"collections":[]}`)
+		case "/rest/assets/reference-1":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"assetId":"reference-1"}`)
+		case "/rest/app-chat/conversations/new":
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedToken, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test", VideoTimeoutSeconds: 5}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	_, err = adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Credential:    account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
+		Prompt:        "animate",
+		Duration:      6,
+		AspectRatio:   "16:9",
+		Resolution:    "720p",
+		ReferenceURLs: []string{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg=="},
+	})
+	stage, ok := provider.VideoErrorStage(err)
+	if err == nil || !ok || stage != provider.VideoStageCreate || !strings.Contains(err.Error(), "没有确认已接收参考图") {
+		t.Fatalf("err = %v, stage = %q, ok = %v", err, stage, ok)
+	}
+}
+
+func TestParseVideoStreamCollectsEchoedReferenceAsset(t *testing.T) {
+	fixture := `{"result":{"response":{"userResponse":{"fileAttachments":["56d94e0e-6aa1-4397-ab4c-66006963848f"],"metadata":{"modelConfigOverride":{"modelMap":{"videoGenModelConfig":{"imageReferences":["https://assets.grok.com/users/_/56d94e0e-6aa1-4397-ab4c-66006963848f/content"]}}}}},"isThinking":false}}}` +
+		`{"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"users/user_1/generated/video_1/generated_video.mp4"}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	_, _, echoed, err := parseVideoStream(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !videoStreamEchoesAssets(echoed, []string{"56d94e0e-6aa1-4397-ab4c-66006963848f"}) {
+		t.Fatalf("echoed = %#v", echoed)
 	}
 }
 
@@ -1783,7 +1840,7 @@ func TestGenerateVideoRefreshesOnlyReloadStatsigForbidden(t *testing.T) {
 
 func TestParseVideoStreamPreservesUpstreamStatus(t *testing.T) {
 	response := &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader("limited"))}
-	_, _, err := parseVideoStream(response, nil)
+	_, _, _, err := parseVideoStream(response, nil)
 	status, ok := provider.ErrorHTTPStatus(err)
 	if !ok || status != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, ok = %v, err = %v", status, ok, err)
@@ -1859,7 +1916,7 @@ func TestParseVideoConcatenatedJSONFixture(t *testing.T) {
 		`{"result":{"response":{"token":"I generated a video","isSoftStop":true}}}`
 	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
 	var values []int
-	result, postID, err := parseVideoStream(response, func(value int) { values = append(values, value) })
+	result, postID, _, err := parseVideoStream(response, func(value int) { values = append(values, value) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1871,7 +1928,7 @@ func TestParseVideoConcatenatedJSONFixture(t *testing.T) {
 func TestParseVideoStreamUsesModelResponseAttachment(t *testing.T) {
 	fixture := `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1"},"modelResponse":{"fileAttachments":["users/user_1/generated/video_1/generated_video.mp4"]}}}}` + "\n"
 	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
-	result, postID, err := parseVideoStream(response, nil)
+	result, postID, _, err := parseVideoStream(response, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

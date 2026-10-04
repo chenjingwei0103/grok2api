@@ -286,7 +286,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
-	result, _, parseErr := parseVideoStream(response, request.Progress)
+	result, _, echoedAssets, parseErr := parseVideoStream(response, request.Progress)
 	_ = response.Body.Close()
 	if parseErr != nil {
 		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
@@ -300,6 +300,17 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	}
 	if result.URL == "" {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePoll, 0, fmt.Errorf("视频生成完成但没有返回内容 URL"))
+	}
+	requiredAssets := make([]string, 0, len(referenceAssets)+1)
+	if firstFrameAsset != "" {
+		requiredAssets = append(requiredAssets, firstFrameAsset)
+	}
+	requiredAssets = append(requiredAssets, referenceAssets...)
+	if len(requiredAssets) > 0 && !videoStreamEchoesAssets(echoedAssets, requiredAssets) {
+		// A 200 that never echoes the uploaded asset did not bind the image.
+		// Treat it as a create failure so the gateway can switch accounts
+		// instead of saving an unrelated video.
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageCreate, 0, fmt.Errorf("视频上游没有确认已接收参考图"))
 	}
 	return result, nil
 }
@@ -467,21 +478,23 @@ func (a *Adapter) DownloadVideo(ctx context.Context, credential account.Credenti
 	return provider.NewCompletionReadCloser(response.Body, onFinished), contentType, response.ContentLength, nil
 }
 
-func parseVideoStream(response *http.Response, progress func(int)) (provider.VideoResult, string, error) {
+func parseVideoStream(response *http.Response, progress func(int)) (provider.VideoResult, string, []string, error) {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, webMediaDiagnosticBodyLimit+1))
 		if response.StatusCode == http.StatusUnauthorized {
-			return provider.VideoResult{}, "", provider.ErrUnauthorized
+			return provider.VideoResult{}, "", nil, provider.ErrUnauthorized
 		}
 		truncated := len(body) > webMediaDiagnosticBodyLimit
 		if truncated {
 			body = body[:webMediaDiagnosticBodyLimit]
 		}
-		return provider.VideoResult{}, "", newWebMediaUpstreamError(response.StatusCode, body, truncated)
+		return provider.VideoResult{}, "", nil, newWebMediaUpstreamError(response.StatusCode, body, truncated)
 	}
 	var result provider.VideoResult
 	var postID string
+	var echoedAssets []string
 	handle := func(root map[string]any) (bool, error) {
+		echoedAssets = collectVideoEchoAssets(echoedAssets, root)
 		if errorValue, ok := root["error"].(map[string]any); ok {
 			return false, webMediaStreamError(errorValue)
 		}
@@ -524,9 +537,103 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		err = consumeVideoJSON(reader, handle)
 	}
 	if err != nil {
-		return provider.VideoResult{}, "", err
+		return provider.VideoResult{}, "", nil, err
 	}
-	return result, postID, nil
+	return result, postID, echoedAssets, nil
+}
+
+func collectVideoEchoAssets(dst []string, root map[string]any) []string {
+	var walk func(any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if videoEchoAssetKey(key) {
+					dst = appendVideoEchoAssetValues(dst, child)
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return dst
+}
+
+func videoEchoAssetKey(key string) bool {
+	switch key {
+	case "fileAttachments", "inputAssets", "imageReferences", "resolvedImageReferences":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendVideoEchoAssetValues(dst []string, value any) []string {
+	switch typed := value.(type) {
+	case string:
+		return appendVideoEchoAssetID(dst, typed)
+	case []any:
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				continue
+			}
+			dst = appendVideoEchoAssetID(dst, text)
+		}
+	}
+	return dst
+}
+
+func appendVideoEchoAssetID(dst []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return dst
+	}
+	if strings.Contains(value, "://") || strings.Contains(value, "/") {
+		path := value
+		if parsed, err := url.Parse(value); err == nil && parsed.Path != "" {
+			path = parsed.Path
+		}
+		for _, segment := range strings.Split(path, "/") {
+			dst = appendVideoEchoAssetID(dst, segment)
+		}
+		return dst
+	}
+	if !videoEchoAssetSegment(value) || containsString(dst, value) {
+		return dst
+	}
+	return append(dst, value)
+}
+
+func videoEchoAssetSegment(value string) bool {
+	if len(value) < 8 || len(value) > 80 || strings.Contains(value, ".") {
+		return false
+	}
+	switch value {
+	case "content", "generated", "users", "videos":
+		return false
+	default:
+		return true
+	}
+}
+
+func videoStreamEchoesAssets(echoed, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	for _, assetID := range required {
+		if assetID == "" {
+			continue
+		}
+		if !containsString(echoed, assetID) {
+			return false
+		}
+	}
+	return true
 }
 
 func webMediaStreamError(value map[string]any) error {
