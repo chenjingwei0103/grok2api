@@ -1591,7 +1591,7 @@ func TestTextToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 }
 
 func TestImageToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
-	payload := videoCreatePayload("animate", "9:16", "480p", 6, "first-frame", []string{"reference-1", "reference-2"})
+	payload := videoCreatePayload("animate", "2:3", "480p", 6, "first-frame", nil)
 	mediaGenInput, ok := payload["mediaGenInput"].(map[string]any)
 	if !ok {
 		t.Fatalf("mediaGenInput = %#v", payload["mediaGenInput"])
@@ -1601,17 +1601,43 @@ func TestImageToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 		t.Fatalf("imageToVideo = %#v", mediaGenInput)
 	}
 	assets, ok := value["inputAssets"].([]string)
-	if !ok || !slices.Equal(assets, []string{"first-frame", "reference-1", "reference-2"}) {
+	if !ok || !slices.Equal(assets, []string{"first-frame"}) {
 		t.Fatalf("inputAssets = %#v", value["inputAssets"])
 	}
-	if value["prompt"] != "animate" || value["aspectRatio"] != "9:16" || value["duration"] != 6 || value["resolutionName"] != "480p" || value["mode"] != "custom" {
+	if value["prompt"] != "animate" || value["aspectRatio"] != "2:3" || value["duration"] != 6 || value["resolutionName"] != "480p" || value["mode"] != "custom" {
 		t.Fatalf("imageToVideo = %#v", value)
 	}
 	if _, exists := mediaGenInput["referenceToVideo"]; exists {
 		t.Fatalf("obsolete referenceToVideo leaked into payload: %#v", mediaGenInput)
 	}
 }
-func TestGenerateVideoUploadsReferenceImagesAndUsesImageToVideo(t *testing.T) {
+
+func TestReferenceToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
+	payload := videoCreatePayload("animate", "2:3", "480p", 6, "", []string{"reference-1", "reference-2", "reference-3", "reference-4"})
+	mediaGenInput, ok := payload["mediaGenInput"].(map[string]any)
+	if !ok {
+		t.Fatalf("mediaGenInput = %#v", payload["mediaGenInput"])
+	}
+	value, ok := mediaGenInput["referenceToVideo"].(map[string]any)
+	if !ok || len(mediaGenInput) != 1 {
+		t.Fatalf("referenceToVideo = %#v", mediaGenInput)
+	}
+	assets, ok := value["inputAssets"].([]string)
+	if !ok || !slices.Equal(assets, []string{"reference-1", "reference-2", "reference-3", "reference-4"}) {
+		t.Fatalf("inputAssets = %#v", value["inputAssets"])
+	}
+	if value["prompt"] != "animate" || value["aspectRatio"] != "2:3" || value["duration"] != 6 || value["resolutionName"] != "480p" {
+		t.Fatalf("referenceToVideo = %#v", value)
+	}
+	if _, exists := value["mode"]; exists {
+		t.Fatalf("referenceToVideo mode = %#v", value["mode"])
+	}
+	if _, exists := mediaGenInput["imageToVideo"]; exists {
+		t.Fatalf("imageToVideo leaked into reference payload: %#v", mediaGenInput)
+	}
+}
+
+func TestGenerateVideoUploadsReferenceImagesAndUsesReferenceToVideo(t *testing.T) {
 	var uploads int
 	var sequence []string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -1634,22 +1660,28 @@ func TestGenerateVideoUploadsReferenceImagesAndUsesImageToVideo(t *testing.T) {
 			}
 			writer.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(writer, `{"collections":[]}`)
-		case "/rest/assets/reference-1":
+		case "/rest/assets/reference-1", "/rest/assets/reference-2", "/rest/assets/reference-3", "/rest/assets/reference-4":
 			writer.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(writer, `{"assetId":"reference-1"}`)
+			_, _ = io.WriteString(writer, `{"assetId":"`+strings.TrimPrefix(request.URL.Path, "/rest/assets/")+`"}`)
 		case "/rest/app-chat/conversations/new":
 			var payload map[string]any
 			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 				t.Errorf("decode video payload: %v", err)
 			}
 			mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
-			imageToVideo, _ := mediaGenInput["imageToVideo"].(map[string]any)
-			assets, _ := imageToVideo["inputAssets"].([]any)
-			if len(assets) != 1 || assets[0] != "reference-1" || imageToVideo["prompt"] != "animate" || imageToVideo["aspectRatio"] != "16:9" || imageToVideo["mode"] != "custom" {
-				t.Errorf("imageToVideo = %#v", imageToVideo)
+			referenceToVideo, _ := mediaGenInput["referenceToVideo"].(map[string]any)
+			assets, _ := referenceToVideo["inputAssets"].([]any)
+			if len(assets) != 4 || assets[0] != "reference-1" || assets[1] != "reference-2" || assets[2] != "reference-3" || assets[3] != "reference-4" || referenceToVideo["prompt"] != "animate" || referenceToVideo["aspectRatio"] != "16:9" || referenceToVideo["duration"] != float64(6) || referenceToVideo["resolutionName"] != "720p" {
+				t.Errorf("referenceToVideo = %#v", referenceToVideo)
+			}
+			if _, exists := referenceToVideo["mode"]; exists {
+				t.Errorf("referenceToVideo mode = %#v", referenceToVideo["mode"])
+			}
+			if _, exists := mediaGenInput["imageToVideo"]; exists {
+				t.Errorf("imageToVideo leaked into reference payload: %#v", mediaGenInput)
 			}
 			writer.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(writer, `data: {"result":{"response":{"userResponse":{"fileAttachments":["reference-1"]}}}}`+"\n"+`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
+			_, _ = io.WriteString(writer, `data: {"result":{"response":{"userResponse":{"fileAttachments":["reference-1","reference-2","reference-3","reference-4"]}}}}`+"\n"+`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
 		default:
 			http.NotFound(writer, request)
 		}
@@ -1666,21 +1698,32 @@ func TestGenerateVideoUploadsReferenceImagesAndUsesImageToVideo(t *testing.T) {
 	}
 	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test", VideoTimeoutSeconds: 5}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
 	request := provider.VideoRequest{
-		Credential:    account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
-		Prompt:        "animate",
-		Duration:      6,
-		AspectRatio:   "16:9",
-		Resolution:    "720p",
-		ReferenceURLs: []string{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg=="},
+		Credential:  account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
+		Prompt:      "animate",
+		Duration:    6,
+		AspectRatio: "16:9",
+		Resolution:  "720p",
+		ReferenceURLs: []string{
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg==",
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg==",
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg==",
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg==",
+		},
 	}
 	result, err := adapter.GenerateVideo(context.Background(), request)
-	if err != nil || result.URL != "https://assets.grok.com/videos/final.mp4" || uploads != 1 {
+	if err != nil || result.URL != "https://assets.grok.com/videos/final.mp4" || uploads != 4 {
 		t.Fatalf("result=%#v uploads=%d err=%v", result, uploads, err)
 	}
 	wantSequence := []string{
 		"POST /http/upload-file-v2/direct",
+		"POST /http/upload-file-v2/direct",
+		"POST /http/upload-file-v2/direct",
+		"POST /http/upload-file-v2/direct",
 		"POST /rest/media/collection/list",
 		"GET /rest/assets/reference-1",
+		"GET /rest/assets/reference-2",
+		"GET /rest/assets/reference-3",
+		"GET /rest/assets/reference-4",
 		"POST /rest/app-chat/conversations/new",
 	}
 	if !slices.Equal(sequence, wantSequence) {

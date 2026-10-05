@@ -744,22 +744,25 @@ func videoSegments(seconds int) []int {
 // prevents text-to-video from depending on a synthetic media post.
 func videoCreatePayload(prompt, ratio, resolution string, seconds int, firstFrameAsset string, referenceAssets []string) map[string]any {
 	mediaGenInput := map[string]any{}
-	if firstFrameAsset == "" && len(referenceAssets) == 0 {
+	switch {
+	case len(referenceAssets) > 0:
+		// The Grok Web UI uses referenceToVideo for one or more reference
+		// assets. It is distinct from imageToVideo and deliberately omits the
+		// first-frame-only custom mode.
+		mediaGenInput["referenceToVideo"] = map[string]any{
+			"prompt": prompt, "inputAssets": referenceAssets, "aspectRatio": ratio,
+			"duration": seconds, "resolutionName": resolution,
+		}
+	case firstFrameAsset != "":
+		// A supplied first frame is an image-to-video request with exactly the
+		// first-frame asset and the Web client's custom mode flag.
+		mediaGenInput["imageToVideo"] = map[string]any{
+			"prompt": prompt, "inputAssets": []string{firstFrameAsset}, "aspectRatio": ratio,
+			"duration": seconds, "resolutionName": resolution, "mode": "custom",
+		}
+	default:
 		mediaGenInput["textToVideo"] = map[string]any{
 			"prompt": prompt, "aspectRatio": ratio, "duration": seconds, "resolutionName": resolution,
-		}
-	} else {
-		// Grok Imagine now uses imageToVideo for every image-conditioned
-		// generation. The first frame and reference images are represented by
-		// their upload order in inputAssets rather than a separate field.
-		inputAssets := make([]string, 0, len(referenceAssets)+1)
-		if firstFrameAsset != "" {
-			inputAssets = append(inputAssets, firstFrameAsset)
-		}
-		inputAssets = append(inputAssets, referenceAssets...)
-		mediaGenInput["imageToVideo"] = map[string]any{
-			"prompt": prompt, "inputAssets": inputAssets, "aspectRatio": ratio,
-			"duration": seconds, "resolutionName": resolution, "mode": "custom",
 		}
 	}
 	return map[string]any{
