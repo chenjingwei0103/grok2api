@@ -31,6 +31,7 @@ type qualityScanState struct {
 	aggregateRunes                  int
 	semanticOutput                  bool
 	toolCallSeen                    bool
+	schemaIndexToolCall             bool
 	requireReasoningAfterRetry      bool
 	reasoningTokens                 int64
 	outputTokens                    int64
@@ -201,6 +202,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		HoldExpired:                s.holdExpired,
 		OutputTokensPerSecond:      outputTokensPerSecond,
 		ToolCallOnly:               s.toolCallSeen && visible <= 0,
+		SchemaIndexToolCall:        s.schemaIndexToolCall,
 		RequireReasoningAfterRetry: s.requireReasoningAfterRetry,
 	}
 }
@@ -340,9 +342,10 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 }
 
 type qualityResponsesOutputItem struct {
-	ID               string `json:"id"`
-	Type             string `json:"type"`
-	EncryptedContent string `json:"encrypted_content"`
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	EncryptedContent string          `json:"encrypted_content"`
+	Arguments        json.RawMessage `json:"arguments"`
 	Content          []struct {
 		Type    string `json:"type"`
 		Text    string `json:"text"`
@@ -369,10 +372,11 @@ func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOu
 
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
-		Type     string                     `json:"type"`
-		Delta    string                     `json:"delta"`
-		Item     qualityResponsesOutputItem `json:"item"`
-		Response *struct {
+		Type      string                     `json:"type"`
+		Delta     string                     `json:"delta"`
+		Arguments json.RawMessage            `json:"arguments"`
+		Item      qualityResponsesOutputItem `json:"item"`
+		Response  *struct {
 			ID     string                       `json:"id"`
 			Model  string                       `json:"model"`
 			Output []qualityResponsesOutputItem `json:"output"`
@@ -409,6 +413,16 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 			state.markGenerated()
 			state.semanticOutput = true
 			state.toolCallSeen = true
+			if schemaIndexArguments([]byte(event.Delta)) {
+				state.schemaIndexToolCall = true
+			}
+		}
+	case "response.function_call_arguments.done", "response.custom_tool_call_input.done", "response.mcp_call_arguments.done":
+		state.markGenerated()
+		state.semanticOutput = true
+		state.toolCallSeen = true
+		if schemaIndexArguments(event.Arguments) {
+			state.schemaIndexToolCall = true
 		}
 	}
 	if event.Response != nil {
@@ -486,6 +500,9 @@ func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResp
 		state.semanticOutput = true
 		if isQualityToolCallType(item.Type) {
 			state.toolCallSeen = true
+			if schemaIndexArguments(item.Arguments) {
+				state.schemaIndexToolCall = true
+			}
 		}
 	}
 	return visibleRunes

@@ -23,6 +23,10 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 		{model: "grok-4.7", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "Build/grok-4.7", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "Console/grok-4.7", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "grok-4.7-fast", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "Build/grok-4.7-fast", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "grok-4.7-build-fast", want: []string{"low", "medium", "high", "xhigh"}},
+		{model: "Build/grok-4.7-build-fast", want: []string{"low", "medium", "high", "xhigh"}},
 		{model: "grok-build-0.1", want: []string{"none"}},
 		{model: GrokComposer25Fast, want: []string{"none"}},
 		{model: "unknown-model", want: []string{"none"}},
@@ -56,6 +60,11 @@ func TestSupportedReasoningEffortsPerModel(t *testing.T) {
 	}
 	if !SupportsReasoningForProvider(account.ProviderBuild, "grok-4.7") {
 		t.Fatal("grok-4.7 must participate in Build quality checks")
+	}
+	for _, modelID := range []string{"grok-4.7-fast", "grok-4.7-build-fast"} {
+		if !SupportsReasoningForProvider(account.ProviderBuild, modelID) || !SupportsReasoningEffort(modelID, "xhigh") {
+			t.Fatalf("%s must participate in Build quality checks", modelID)
+		}
 	}
 	if !SupportsReasoningEffort("grok-4.7", "xhigh") || !SupportsReasoningEffortForProvider(account.ProviderConsole, "grok-4.7", "xhigh") {
 		t.Fatal("grok-4.7 must preserve grok-4.6 reasoning effort coverage")

@@ -717,16 +717,16 @@ func TestNormalizeAccountModelCapabilitiesSuperAddsVideo15(t *testing.T) {
 	}
 }
 
-func TestNormalizeAccountModelCapabilitiesAddsComposerOnlyForBuildOAuth(t *testing.T) {
+func TestNormalizeAccountModelCapabilitiesAddsSessionModelsOnlyForBuildOAuth(t *testing.T) {
 	adapter := &Adapter{}
 	oauth := account.Credential{Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth}
 	got := adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5"}, &account.Billing{PlanName: "free"}, oauth)
-	if len(got) != 2 || got[0] != "grok-4.5" || got[1] != modeldomain.GrokComposer25Fast {
+	if len(got) != 3 || got[0] != "grok-4.5" || got[1] != modeldomain.GrokComposer25Fast || got[2] != buildGrok47FastModel {
 		t.Fatalf("OAuth Free capabilities = %#v", got)
 	}
-	got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5", modeldomain.GrokComposer25Fast, modeldomain.GrokComposer25Fast}, nil, oauth)
-	if len(got) != 2 || got[0] != "grok-4.5" || got[1] != modeldomain.GrokComposer25Fast {
-		t.Fatalf("Composer capability was not deduplicated: %#v", got)
+	got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5", modeldomain.GrokComposer25Fast, buildGrok47FastModel, modeldomain.GrokComposer25Fast, buildGrok47FastModel}, nil, oauth)
+	if len(got) != 3 || got[0] != "grok-4.5" || got[1] != modeldomain.GrokComposer25Fast || got[2] != buildGrok47FastModel {
+		t.Fatalf("Build OAuth session capabilities were not deduplicated: %#v", got)
 	}
 	for _, credential := range []account.Credential{
 		{Provider: account.ProviderBuild, AuthType: account.AuthTypeSSO},
@@ -734,7 +734,7 @@ func TestNormalizeAccountModelCapabilitiesAddsComposerOnlyForBuildOAuth(t *testi
 	} {
 		got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5"}, nil, credential)
 		if len(got) != 1 || got[0] != "grok-4.5" {
-			t.Fatalf("Composer leaked outside Build OAuth for %#v: %#v", credential, got)
+			t.Fatalf("Build OAuth session model leaked outside Build OAuth for %#v: %#v", credential, got)
 		}
 	}
 }

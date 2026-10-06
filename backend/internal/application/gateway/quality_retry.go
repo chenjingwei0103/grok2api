@@ -116,6 +116,10 @@ type QualityStreamSignals struct {
 	// call and which contains no user-visible text. Tool arguments are not
 	// ordinary answer text and must not trigger the output-speed guard.
 	ToolCallOnly bool
+	// SchemaIndexToolCall is a tool call whose arguments are only schema
+	// field numbers, for example {"kind":1,"mode":2}. The conversation copied
+	// an invalid call; this is not evidence that the account is degraded.
+	SchemaIndexToolCall bool
 	// RequireReasoningAfterRetry is set only after this request has already
 	// retried a response with no reasoning evidence.
 	RequireReasoningAfterRetry bool
@@ -366,6 +370,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 // delivered a buffered chunk quickly. The threshold is independent of output
 // length: even a one-token terminal response is retried when it exceeds it.
 func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, maxOutputTokensPerSecond float64) QualityVerdict {
+	if sig.SchemaIndexToolCall && (sig.Terminal || sig.HoldExpired) {
+		return QualityWithhold
+	}
 	if sig.Terminal && sig.ToolCallOnly && !sig.RequireReasoningAfterRetry {
 		return QualityDeliver
 	}
@@ -378,7 +385,7 @@ func classifyQualityHoldWithSpeed(sig QualityStreamSignals, minOutput int64, max
 }
 
 func qualityRetryNeedsReasoningAfterRetry(sig QualityStreamSignals, verdict QualityVerdict) bool {
-	return verdict == QualityWithhold && !sig.HasThinking
+	return verdict == QualityWithhold && !sig.HasThinking && !sig.SchemaIndexToolCall
 }
 
 // qualityPeekAbortError prefers the idle-timeout cause over a plain

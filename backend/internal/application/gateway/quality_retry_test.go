@@ -1399,6 +1399,15 @@ func TestPeekQualityStreamTerminalSemanticOutputIsNotEmpty(t *testing.T) {
 			wantVerdict: QualityDeliver,
 		},
 		{
+			name:     "responses schema index function call",
+			protocol: qualityProtocolResponses,
+			stream: sse(
+				`data: {"type":"response.function_call_arguments.done","arguments":"{\"kind\":1,\"mode\":2,\"name\":3,\"prompt\":4,\"rruleSchedule\":5,\"status\":6}"}`,
+				`data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"function_call","call_id":"call_1","name":"automation_update","arguments":"{\"kind\":1,\"mode\":2,\"name\":3,\"prompt\":4,\"rruleSchedule\":5,\"status\":6}"}]}}`,
+			),
+			wantVerdict: QualityWithhold,
+		},
+		{
 			name:     "responses streamed function call",
 			protocol: qualityProtocolResponses,
 			stream: sse(
@@ -1522,6 +1531,15 @@ func TestShouldHoldQualityStreamGates(t *testing.T) {
 	grok47Input := Input{Streaming: true, PublicModel: "grok-4.7"}
 	if !shouldHoldQualityStream(grok47Input, nil, grok47Route, audit.OperationResponses, cfg) {
 		t.Fatal("expected hold on grok-4.7 Build responses")
+	}
+	fastRoute := modeldomain.Route{Provider: accountdomain.ProviderBuild, UpstreamModel: "grok-4.7-build-fast", PublicID: "grok-4.7-fast"}
+	fastInput := Input{Streaming: true, PublicModel: "grok-4.7-fast"}
+	if !shouldHoldQualityStream(fastInput, nil, fastRoute, audit.OperationResponses, cfg) {
+		t.Fatal("expected hold on grok-4.7-fast Build responses")
+	}
+	buildFastInput := Input{Streaming: true, PublicModel: "grok-4.7-build-fast"}
+	if !shouldHoldQualityStream(buildFastInput, nil, fastRoute, audit.OperationResponses, cfg) {
+		t.Fatal("expected hold on grok-4.7-build-fast Build responses")
 	}
 	off := cfg
 	off.Enabled = false

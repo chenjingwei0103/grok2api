@@ -1070,11 +1070,19 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	normalizedMetadata := &provider.NormalizedRequestMetadata{}
 	responseStartedAt := startedAt
+	upstreamBody, strippedSchemaToolCalls := stripSchemaIndexToolCalls(input.Body)
+	if strippedSchemaToolCalls > 0 {
+		s.logger.Info("schema_index_tool_calls_stripped", "request_id", input.RequestID, "removed", strippedSchemaToolCalls)
+	}
+	if updatedBody, repeatedToolCall := appendQuestionForRepeatedToolCall(upstreamBody); repeatedToolCall {
+		upstreamBody = updatedBody
+		s.logger.Info("repeated_tool_call_question_appended", "request_id", input.RequestID, "marker", "?")
+	}
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
 		lease.markSelectorUpstreamStarted()
-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: upstreamBody, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation), NormalizedMetadata: normalizedMetadata})
 		auditBase.ReasoningEffort = normalizedMetadata.ReasoningEffort
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
@@ -1712,18 +1720,23 @@ attemptLoop:
 				}
 				if peek.verdict == QualityWithhold {
 					captureAbnormalRequest()
-					cooldown := holdCfg.AccountCooldown
-					// Usage not reported yet (logged as output_tokens=0) is the
-					// empty/short-hold path, not a confirmed 128k missing-thinking
-					// dump. Use idle cooldown so one TUI turn does not 1.5h-burn
-					// five accounts.
-					if peek.usage.OutputTokens == 0 && peek.usage.ReasoningTokens == 0 {
-						cooldown = holdCfg.IdleAccountCooldown
-						if cooldown <= 0 {
-							cooldown = qualityIdleAccountCooldown
+					// A copied schema-index tool call is conversation state, not
+					// an account-quality failure. Retry it without cooling the
+					// account that happened to receive the poisoned transcript.
+					if !peek.capture.signals().SchemaIndexToolCall {
+						cooldown := holdCfg.AccountCooldown
+						// Usage not reported yet (logged as output_tokens=0) is the
+						// empty/short-hold path, not a confirmed 128k missing-thinking
+						// dump. Use idle cooldown so one TUI turn does not 1.5h-burn
+						// five accounts.
+						if peek.usage.OutputTokens == 0 && peek.usage.ReasoningTokens == 0 {
+							cooldown = holdCfg.IdleAccountCooldown
+							if cooldown <= 0 {
+								cooldown = qualityIdleAccountCooldown
+							}
 						}
+						s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, cooldown)
 					}
-					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, cooldown)
 				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
