@@ -50,6 +50,7 @@ const (
 	buildControlTimeout     = 30 * time.Second
 	buildGrok45Model        = "grok-4.5"
 	buildGrok46Model        = "grok-4.6"
+	buildGrok47FastModel    = "grok-4.7-build-fast"
 )
 
 // Adapter implements the Grok Build CLI Responses, model, Billing, and OAuth protocols.
@@ -684,8 +685,8 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 
 // NormalizeAccountModelCapabilities normalizes capabilities that the OAuth
 // session contract exposes independently of the account's sparse /models list.
-// Composer is available to Build OAuth sessions independently of the sparse
-// live catalog. Grok 4.6 sessions retain the still-supported Grok 4.5 route for
+// Composer and grok-4.7-build-fast are available to Build OAuth sessions
+// independently of the sparse live catalog. Grok 4.6 sessions retain the still-supported Grok 4.5 route for
 // backwards compatibility. Super always includes video 1.5; Free and Unknown
 // remove video 1.5 exactly. BuildAPIFallback is ignored.
 func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
@@ -727,6 +728,9 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 	if composer {
 		if _, exists := seen[modeldomain.GrokComposer25Fast]; !exists {
 			result = append(result, modeldomain.GrokComposer25Fast)
+		}
+		if _, exists := seen[buildGrok47FastModel]; !exists {
+			result = append(result, buildGrok47FastModel)
 		}
 	}
 	return result
