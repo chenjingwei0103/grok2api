@@ -267,7 +267,7 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/responses" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
-		if r.Header.Get("Authorization") != "Bearer access-token" || r.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" || r.Header.Get("x-authenticateresponse") != "authenticate-response" || r.Header.Get("x-grok-client-version") != "0.2.102" || r.Header.Get("x-grok-client-identifier") != "grok-shell" || r.Header.Get("x-grok-client-mode") != "headless" || r.Header.Get("User-Agent") != "grok-shell/0.2.102 (linux; x86_64)" {
+		if r.Header.Get("Authorization") != "Bearer access-token" || r.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" || r.Header.Get("x-authenticateresponse") != "authenticate-response" || r.Header.Get("x-grok-client-version") != "0.2.102" || r.Header.Get("x-grok-client-identifier") != "grok-shell" || r.Header.Get("x-grok-client-mode") != "interactive" || r.Header.Get("User-Agent") != "grok-shell/0.2.102 (linux; x86_64)" {
 			t.Fatalf("headers = %#v", r.Header)
 		}
 		requestID := r.Header.Get("x-grok-req-id")
@@ -526,7 +526,7 @@ func TestListModelsUsesOfficialMetadataHeaders(t *testing.T) {
 	}
 	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1", ClientVersion: "0.2.102", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", UserAgent: "grok-shell/0.2.102 (linux; x86_64)"}, cipher)
 	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Path != "/v1/models" || request.Header.Get("Authorization") != "Bearer access-token" || request.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" || request.Header.Get("x-grok-client-version") != "0.2.102" || request.Header.Get("x-grok-client-identifier") != "grok-shell" || request.Header.Get("x-grok-client-mode") != "headless" || request.Header.Get("User-Agent") != "grok-shell/0.2.102 (linux; x86_64)" {
+		if request.URL.Path != "/v1/models" || request.Header.Get("Authorization") != "Bearer access-token" || request.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" || request.Header.Get("x-grok-client-version") != "0.2.102" || request.Header.Get("x-grok-client-identifier") != "grok-shell" || request.Header.Get("x-grok-client-mode") != "interactive" || request.Header.Get("User-Agent") != "grok-shell/0.2.102 (linux; x86_64)" {
 			t.Fatalf("headers = %#v", request.Header)
 		}
 		if request.Header.Get("x-userid") != "user-123" || request.Header.Get("x-email") != "user@example.com" || request.Header.Get("x-grok-user-id") != "" || request.Header.Get("x-authenticateresponse") != "" || request.Header.Get("x-grok-session-id") != "" {

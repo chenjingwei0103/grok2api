@@ -24,7 +24,7 @@ func TestAppendQuestionForRepeatedToolCallResponses(t *testing.T) {
 		t.Fatalf("input length = %d, want 6", len(root.Input))
 	}
 	last := root.Input[len(root.Input)-1]
-	if last["type"] != "message" || last["role"] != "user" || last["content"] != "?" {
+	if last["type"] != "message" || last["role"] != "user" || last["content"] != "continue" {
 		t.Fatalf("appended item = %#v", last)
 	}
 }
@@ -63,14 +63,14 @@ func TestAppendQuestionForRepeatedToolCallCanonicalizesJSONArguments(t *testing.
 	if !repeated {
 		t.Fatal("JSON-equivalent arguments must be treated as the same tool call")
 	}
-	if !bytes.Contains(got, []byte(`"content":"?"`)) {
+	if !bytes.Contains(got, []byte(`"content":"continue"`)) {
 		t.Fatalf("appended question missing from body: %s", got)
 	}
 }
 
 func TestAppendQuestionForRepeatedToolCallDoesNotAppendTwice(t *testing.T) {
 	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"check"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"},{"type":"message","role":"user","content":"?"}]}`)
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"check"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"},{"type":"message","role":"user","content":"continue"}]}`)
 
 	got, repeated := appendQuestionForRepeatedToolCall(body)
 	if repeated {
@@ -83,7 +83,7 @@ func TestAppendQuestionForRepeatedToolCallDoesNotAppendTwice(t *testing.T) {
 
 func TestAppendQuestionForRepeatedToolCallResetsAfterNewUserTurn(t *testing.T) {
 	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"?"},{"type":"message","role":"user","content":"new turn"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"}]}`)
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"continue"},{"type":"message","role":"user","content":"new turn"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"}]}`)
 
 	got, repeated := appendQuestionForRepeatedToolCall(body)
 	if !repeated {
@@ -95,7 +95,7 @@ func TestAppendQuestionForRepeatedToolCallResetsAfterNewUserTurn(t *testing.T) {
 	if err := json.Unmarshal(got, &root); err != nil {
 		t.Fatal(err)
 	}
-	if len(root.Input) != 7 || root.Input[len(root.Input)-1]["content"] != "?" {
+	if len(root.Input) != 7 || root.Input[len(root.Input)-1]["content"] != "continue" {
 		t.Fatalf("appended input = %#v", root.Input)
 	}
 }
@@ -114,7 +114,7 @@ func TestAppendQuestionForRepeatedCustomToolCall(t *testing.T) {
 	if err := json.Unmarshal(got, &root); err != nil {
 		t.Fatal(err)
 	}
-	if len(root.Input) != 6 || root.Input[len(root.Input)-1]["content"] != "?" {
+	if len(root.Input) != 6 || root.Input[len(root.Input)-1]["content"] != "continue" {
 		t.Fatalf("appended input = %#v", root.Input)
 	}
 }

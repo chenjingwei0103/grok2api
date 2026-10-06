@@ -955,7 +955,7 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 	req.Header.Set("X-XAI-Token-Auth", cfg.TokenAuth)
 	req.Header.Set("x-grok-client-version", cfg.ClientVersion)
 	req.Header.Set("x-grok-client-identifier", cfg.ClientIdentifier)
-	req.Header.Set("x-grok-client-mode", "headless")
+	req.Header.Set("x-grok-client-mode", "interactive")
 
 	if trace {
 		requestID := uuid.NewString()

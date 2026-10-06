@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// appendQuestionForRepeatedToolCall adds one explicit user question to a
+// appendQuestionForRepeatedToolCall adds one explicit user continue message to a
 // Responses request when the same completed tool call appears twice without a
 // new user message. The question is intentionally added to the upstream body
 // only; the original client request remains unchanged for audit/replay.
@@ -26,10 +26,10 @@ func appendQuestionForRepeatedToolCall(body []byte) ([]byte, bool) {
 	if !hasRepeatedCompletedToolCall(items) {
 		return body, false
 	}
-	if hasQuestionUserMessage(items) {
+	if hasContinueUserMessage(items) {
 		return body, false
 	}
-	items = append(items, json.RawMessage(`{"type":"message","role":"user","content":"?"}`))
+	items = append(items, json.RawMessage(`{"type":"message","role":"user","content":"continue"}`))
 	encodedInput, err := json.Marshal(items)
 	if err != nil {
 		return body, false
@@ -88,14 +88,14 @@ func hasRepeatedCompletedToolCall(items []json.RawMessage) bool {
 	return false
 }
 
-func hasQuestionUserMessage(items []json.RawMessage) bool {
+func hasContinueUserMessage(items []json.RawMessage) bool {
 	markerInCurrentTurn := false
 	for _, raw := range items {
 		item := decodeRawObject(raw)
 		if item == nil || !isMeaningfulUserInput(item) {
 			continue
 		}
-		if strings.TrimSpace(userInputText(item)) == "?" {
+		if strings.TrimSpace(userInputText(item)) == "continue" {
 			markerInCurrentTurn = true
 			continue
 		}

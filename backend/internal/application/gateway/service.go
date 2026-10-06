@@ -1076,7 +1076,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	}
 	if updatedBody, repeatedToolCall := appendQuestionForRepeatedToolCall(upstreamBody); repeatedToolCall {
 		upstreamBody = updatedBody
-		s.logger.Info("repeated_tool_call_question_appended", "request_id", input.RequestID, "marker", "?")
+		s.logger.Info("repeated_tool_call_question_appended", "request_id", input.RequestID, "marker", "continue")
 	}
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
