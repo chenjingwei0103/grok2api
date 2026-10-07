@@ -1637,6 +1637,65 @@ func TestReferenceToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) 
 	}
 }
 
+func TestVideoTraceAttributesAreRedactedAndDescribeAssetBinding(t *testing.T) {
+	tests := []struct {
+		name               string
+		firstFrameAsset    string
+		referenceAssets    []string
+		wantMode           string
+		wantInputCount     int
+		wantFirstCount     int
+		wantReferenceCount int
+	}{
+		{name: "text", wantMode: "textToVideo"},
+		{name: "first frame", firstFrameAsset: "first-frame-asset", wantMode: "imageToVideo", wantInputCount: 1, wantFirstCount: 1},
+		{name: "references", referenceAssets: []string{"reference-asset-1", "reference-asset-2"}, wantMode: "referenceToVideo", wantInputCount: 2, wantReferenceCount: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := provider.VideoRequest{
+				JobID:       "job-video-trace-1",
+				Model:       "grok-imagine-video",
+				Prompt:      "灯塔菜市场 token=do-not-log",
+				Duration:    6,
+				AspectRatio: "16:9",
+				Resolution:  "720p",
+			}
+			if test.wantMode == "imageToVideo" {
+				request.ImageURL = "data:image/jpeg;base64,redacted-test-input"
+			}
+			if test.wantMode == "referenceToVideo" {
+				request.ReferenceURLs = []string{"data:image/jpeg;base64,redacted-test-input"}
+			}
+			attributes := videoTraceAttributes(request, test.firstFrameAsset, test.referenceAssets)
+			if attributes["mode"] != test.wantMode || attributes["input_asset_count"] != test.wantInputCount ||
+				attributes["first_frame_asset_count"] != test.wantFirstCount || attributes["reference_asset_count"] != test.wantReferenceCount {
+				t.Fatalf("trace attributes = %#v", attributes)
+			}
+			if attributes["job_id"] != request.JobID || attributes["prompt_bytes"] != len([]byte(request.Prompt)) ||
+				attributes["duration_seconds"] != request.Duration || attributes["aspect_ratio"] != request.AspectRatio ||
+				attributes["resolution"] != request.Resolution {
+				t.Fatalf("request metadata missing from trace attributes = %#v", attributes)
+			}
+			if _, exists := attributes["prompt"]; exists {
+				t.Fatalf("raw prompt leaked into trace attributes: %#v", attributes)
+			}
+			encoded, err := json.Marshal(attributes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{"灯塔菜市场", "do-not-log", "token=", "data:image", "https://"} {
+				if strings.Contains(string(encoded), forbidden) {
+					t.Fatalf("trace attributes leaked %q: %s", forbidden, encoded)
+				}
+			}
+			if attributes["prompt_sha256"] != sha256HexForVideoTrace(request.Prompt) {
+				t.Fatalf("prompt hash = %#v", attributes["prompt_sha256"])
+			}
+		})
+	}
+}
+
 func TestGenerateVideoUploadsReferenceImagesAndUsesReferenceToVideo(t *testing.T) {
 	var uploads int
 	var sequence []string

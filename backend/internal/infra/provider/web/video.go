@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -177,6 +178,119 @@ func (a *Adapter) logWebMediaUpstreamRejection(stage string, response *http.Resp
 	a.log().Warn("web_media_upstream_rejected", attributes...)
 }
 
+func (a *Adapter) logVideoTrace(event string, attributes map[string]any) {
+	if len(attributes) == 0 {
+		a.log().Info(event)
+		return
+	}
+	keys := make([]string, 0, len(attributes))
+	for key := range attributes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	args := make([]any, 0, len(keys)*2)
+	for _, key := range keys {
+		args = append(args, key, attributes[key])
+	}
+	a.log().Info(event, args...)
+}
+
+func sha256HexForVideoTrace(value string) string {
+	return sha256HexForVideoTraceBytes([]byte(value))
+}
+
+func sha256HexForVideoTraceBytes(value []byte) string {
+	digest := sha256.Sum256(value)
+	return fmt.Sprintf("%x", digest)
+}
+
+func videoAssetIDHashes(values []string) []string {
+	hashes := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		hashes = append(hashes, sha256HexForVideoTrace(value))
+	}
+	return hashes
+}
+
+func videoRequestedReferenceCount(values []string) int {
+	count := 0
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func videoTraceAttributes(request provider.VideoRequest, firstFrameAsset string, referenceAssets []string) map[string]any {
+	firstFrameAsset = strings.TrimSpace(firstFrameAsset)
+	assets := make([]string, 0, len(referenceAssets)+1)
+	if firstFrameAsset != "" {
+		assets = append(assets, firstFrameAsset)
+	}
+	for _, asset := range referenceAssets {
+		if strings.TrimSpace(asset) != "" {
+			assets = append(assets, strings.TrimSpace(asset))
+		}
+	}
+
+	mode := "textToVideo"
+	if videoRequestedReferenceCount(request.ReferenceURLs) > 0 || len(referenceAssets) > 0 {
+		mode = "referenceToVideo"
+	} else if strings.TrimSpace(request.ImageURL) != "" || firstFrameAsset != "" {
+		mode = "imageToVideo"
+	}
+	attributes := map[string]any{
+		"job_id":                    safeWebMediaDiagnostic(request.JobID, 128),
+		"model":                     safeWebMediaDiagnostic(request.Model, 64),
+		"mode":                      mode,
+		"requested_first_frame":     strings.TrimSpace(request.ImageURL) != "",
+		"requested_reference_count": videoRequestedReferenceCount(request.ReferenceURLs),
+		"first_frame_asset_count":   boolToInt(firstFrameAsset != ""),
+		"reference_asset_count":     len(referenceAssets),
+		"input_asset_count":         len(assets),
+		"input_asset_sha256":        videoAssetIDHashes(assets),
+		"prompt_bytes":              len([]byte(request.Prompt)),
+		"prompt_sha256":             sha256HexForVideoTrace(request.Prompt),
+		"duration_seconds":          request.Duration,
+		"aspect_ratio":              safeWebMediaDiagnostic(request.AspectRatio, 32),
+		"resolution":                safeWebMediaDiagnostic(request.Resolution, 32),
+	}
+	return attributes
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func videoSourceKind(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "empty"
+	}
+	if strings.HasPrefix(strings.ToLower(value), "data:") {
+		return "data_url"
+	}
+	return "remote_url"
+}
+
+func missingVideoAssets(echoed, required []string) []string {
+	missing := make([]string, 0)
+	for _, assetID := range required {
+		if assetID != "" && !containsString(echoed, assetID) {
+			missing = append(missing, assetID)
+		}
+	}
+	return missing
+}
+
 func summarizeWebMediaUpstreamError(status int, body []byte, truncated bool) string {
 	code, message, structured := extractWebMediaUpstreamErrorFields(body)
 	parts := []string{fmt.Sprintf("Grok Web 媒体上游返回 %d", status)}
@@ -252,6 +366,7 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	a.logVideoTrace("video_generation_started", videoTraceAttributes(request, "", nil))
 	if len(request.ReferenceAudios) > 0 {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前不支持 reference_audios"))
 	}
@@ -276,18 +391,49 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	}
 	firstFrameAsset, referenceAssets, err := a.uploadVideoReferenceAssets(ctx, cfg, lease, token, request)
 	if err != nil {
+		attributes := videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+		attributes["phase"] = "reference_upload"
+		attributes["error"] = safeWebMediaDiagnostic(err.Error(), webMediaDiagnosticSummaryLimit)
+		a.logVideoTrace("video_reference_upload_failed", attributes)
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
+	attributes := videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+	attributes["phase"] = "reference_upload_complete"
+	a.logVideoTrace("video_reference_uploads_completed", attributes)
 	if err := a.prepareVideoImagineSession(ctx, cfg, lease, token, firstFrameAsset, referenceAssets); err != nil {
+		attributes := videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+		attributes["phase"] = "asset_visibility_check"
+		attributes["error"] = safeWebMediaDiagnostic(err.Error(), webMediaDiagnosticSummaryLimit)
+		a.logVideoTrace("video_reference_binding_failed", attributes)
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
+	attributes = videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+	attributes["phase"] = "asset_visibility_check_passed"
+	a.logVideoTrace("video_reference_assets_visible", attributes)
 	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0], firstFrameAsset, referenceAssets)
+	attributes = videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+	attributes["phase"] = "create_payload"
+	a.logVideoTrace("video_create_payload", attributes)
 	response, err := a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second, cfg.BaseURL+"/imagine")
 	if err != nil {
+		attributes := videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+		attributes["phase"] = "create_request"
+		attributes["error"] = safeWebMediaDiagnostic(err.Error(), webMediaDiagnosticSummaryLimit)
+		a.logVideoTrace("video_create_request_failed", attributes)
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
 	result, _, echoedAssets, parseErr := parseVideoStream(response, request.Progress)
 	_ = response.Body.Close()
+	attributes = videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+	attributes["phase"] = "upstream_response"
+	attributes["upstream_status"] = response.StatusCode
+	attributes["upstream_echoed_asset_count"] = len(echoedAssets)
+	attributes["upstream_echoed_asset_sha256"] = videoAssetIDHashes(echoedAssets)
+	attributes["video_url_present"] = result.URL != ""
+	if parseErr != nil {
+		attributes["error"] = safeWebMediaDiagnostic(parseErr.Error(), webMediaDiagnosticSummaryLimit)
+	}
+	a.logVideoTrace("video_upstream_response", attributes)
 	if parseErr != nil {
 		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
 			a.logWebMediaUpstreamRejection("video_generation", response, upstreamErr)
@@ -306,12 +452,21 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		requiredAssets = append(requiredAssets, firstFrameAsset)
 	}
 	requiredAssets = append(requiredAssets, referenceAssets...)
-	if len(requiredAssets) > 0 && !videoStreamEchoesAssets(echoedAssets, requiredAssets) {
+	missingAssets := missingVideoAssets(echoedAssets, requiredAssets)
+	if len(missingAssets) > 0 {
 		// A 200 that never echoes the uploaded asset did not bind the image.
 		// Treat it as a create failure so the gateway can switch accounts
 		// instead of saving an unrelated video.
+		attributes := videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+		attributes["phase"] = "asset_binding"
+		attributes["missing_asset_count"] = len(missingAssets)
+		attributes["missing_asset_sha256"] = videoAssetIDHashes(missingAssets)
+		a.logVideoTrace("video_reference_binding_failed", attributes)
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStageCreate, 0, fmt.Errorf("视频上游没有确认已接收参考图"))
 	}
+	attributes = videoTraceAttributes(request, firstFrameAsset, referenceAssets)
+	attributes["phase"] = "completed"
+	a.logVideoTrace("video_generation_completed", attributes)
 	return result, nil
 }
 
@@ -383,11 +538,25 @@ func readWebMediaUpstreamError(response *http.Response) error {
 	return newWebMediaUpstreamError(response.StatusCode, body, truncated)
 }
 func (a *Adapter) uploadVideoReferenceAssets(ctx context.Context, cfg Config, lease *infraegress.Lease, token string, request provider.VideoRequest) (string, []string, error) {
-	upload := func(rawURL, stage string) (string, error) {
+	upload := func(rawURL, stage string, index int) (string, error) {
+		a.logVideoTrace("video_reference_upload_started", map[string]any{
+			"job_id":      safeWebMediaDiagnostic(request.JobID, 128),
+			"stage":       stage,
+			"input_index": index,
+			"source_kind": videoSourceKind(rawURL),
+		})
 		image, err := a.loadChatImage(ctx, lease, rawURL, cfg.MaxInputImageBytes)
 		if err != nil {
 			return "", err
 		}
+		a.logVideoTrace("video_reference_image_loaded", map[string]any{
+			"job_id":       safeWebMediaDiagnostic(request.JobID, 128),
+			"stage":        stage,
+			"input_index":  index,
+			"mime_type":    safeWebMediaDiagnostic(image.MIMEType, 128),
+			"image_bytes":  len(image.Data),
+			"image_sha256": sha256HexForVideoTraceBytes(image.Data),
+		})
 		uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, stage)
 		if err != nil {
 			return "", err
@@ -395,24 +564,32 @@ func (a *Adapter) uploadVideoReferenceAssets(ctx context.Context, cfg Config, le
 		if uploaded.MetadataID == "" {
 			return "", fmt.Errorf("上传视频参考图成功但上游未返回 fileMetadataId")
 		}
+		a.logVideoTrace("video_reference_uploaded", map[string]any{
+			"job_id":            safeWebMediaDiagnostic(request.JobID, 128),
+			"stage":             stage,
+			"input_index":       index,
+			"asset_id_sha256":   sha256HexForVideoTrace(uploaded.MetadataID),
+			"upload_id_present": uploaded.ID != "",
+			"asset_uri_present": uploaded.URI != "",
+		})
 		return uploaded.MetadataID, nil
 	}
 
 	firstFrameAsset := ""
 	if rawURL := strings.TrimSpace(request.ImageURL); rawURL != "" {
-		asset, err := upload(rawURL, "video_first_frame_upload")
+		asset, err := upload(rawURL, "video_first_frame_upload", 0)
 		if err != nil {
 			return "", nil, err
 		}
 		firstFrameAsset = asset
 	}
 	referenceAssets := make([]string, 0, len(request.ReferenceURLs))
-	for _, rawURL := range request.ReferenceURLs {
+	for index, rawURL := range request.ReferenceURLs {
 		rawURL = strings.TrimSpace(rawURL)
 		if rawURL == "" {
 			continue
 		}
-		asset, err := upload(rawURL, "video_reference_upload")
+		asset, err := upload(rawURL, "video_reference_upload", index)
 		if err != nil {
 			return "", nil, err
 		}
