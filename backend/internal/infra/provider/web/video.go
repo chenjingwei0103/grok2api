@@ -238,10 +238,20 @@ func videoTraceAttributes(request provider.VideoRequest, firstFrameAsset string,
 		}
 	}
 
+	referenceCount := 0
+	for _, asset := range referenceAssets {
+		if strings.TrimSpace(asset) != "" {
+			referenceCount++
+		}
+	}
+	if referenceCount == 0 {
+		referenceCount = videoRequestedReferenceCount(request.ReferenceURLs)
+	}
 	mode := "textToVideo"
-	if videoRequestedReferenceCount(request.ReferenceURLs) > 0 || len(referenceAssets) > 0 {
+	switch {
+	case referenceCount >= 2:
 		mode = "referenceToVideo"
-	} else if strings.TrimSpace(request.ImageURL) != "" || firstFrameAsset != "" {
+	case referenceCount == 1 || strings.TrimSpace(request.ImageURL) != "" || firstFrameAsset != "":
 		mode = "imageToVideo"
 	}
 	attributes := map[string]any{
@@ -922,13 +932,19 @@ func videoSegments(seconds int) []int {
 func videoCreatePayload(prompt, ratio, resolution string, seconds int, firstFrameAsset string, referenceAssets []string) map[string]any {
 	mediaGenInput := map[string]any{}
 	switch {
-	case len(referenceAssets) > 0:
-		// The Grok Web UI uses referenceToVideo for one or more reference
-		// assets. It is distinct from imageToVideo and deliberately omits the
-		// first-frame-only custom mode.
+	case len(referenceAssets) >= 2:
+		// Two or more reference assets stay on referenceToVideo. That payload
+		// has no custom mode and must not be collapsed into imageToVideo.
 		mediaGenInput["referenceToVideo"] = map[string]any{
 			"prompt": prompt, "inputAssets": referenceAssets, "aspectRatio": ratio,
 			"duration": seconds, "resolutionName": resolution,
+		}
+	case len(referenceAssets) == 1:
+		// A single reference image uses the same imageToVideo shape as a
+		// first frame. referenceToVideo does not reliably bind one image.
+		mediaGenInput["imageToVideo"] = map[string]any{
+			"prompt": prompt, "inputAssets": referenceAssets, "aspectRatio": ratio,
+			"duration": seconds, "resolutionName": resolution, "mode": "custom",
 		}
 	case firstFrameAsset != "":
 		// A supplied first frame is an image-to-video request with exactly the

@@ -1612,6 +1612,28 @@ func TestImageToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 	}
 }
 
+func TestSingleReferenceAssetUsesImageToVideo(t *testing.T) {
+	payload := videoCreatePayload("animate", "2:3", "720p", 6, "", []string{"reference-1"})
+	mediaGenInput, ok := payload["mediaGenInput"].(map[string]any)
+	if !ok {
+		t.Fatalf("mediaGenInput = %#v", payload["mediaGenInput"])
+	}
+	if _, exists := mediaGenInput["referenceToVideo"]; exists {
+		t.Fatalf("single reference used referenceToVideo: %#v", mediaGenInput)
+	}
+	value, ok := mediaGenInput["imageToVideo"].(map[string]any)
+	if !ok || len(mediaGenInput) != 1 {
+		t.Fatalf("imageToVideo = %#v", mediaGenInput)
+	}
+	assets, ok := value["inputAssets"].([]string)
+	if !ok || !slices.Equal(assets, []string{"reference-1"}) {
+		t.Fatalf("inputAssets = %#v", value["inputAssets"])
+	}
+	if value["mode"] != "custom" {
+		t.Fatalf("mode = %#v", value["mode"])
+	}
+}
+
 func TestReferenceToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 	payload := videoCreatePayload("animate", "2:3", "480p", 6, "", []string{"reference-1", "reference-2", "reference-3", "reference-4"})
 	mediaGenInput, ok := payload["mediaGenInput"].(map[string]any)
@@ -1649,6 +1671,7 @@ func TestVideoTraceAttributesAreRedactedAndDescribeAssetBinding(t *testing.T) {
 	}{
 		{name: "text", wantMode: "textToVideo"},
 		{name: "first frame", firstFrameAsset: "first-frame-asset", wantMode: "imageToVideo", wantInputCount: 1, wantFirstCount: 1},
+		{name: "single reference", referenceAssets: []string{"reference-asset-1"}, wantMode: "imageToVideo", wantInputCount: 1, wantReferenceCount: 1},
 		{name: "references", referenceAssets: []string{"reference-asset-1", "reference-asset-2"}, wantMode: "referenceToVideo", wantInputCount: 2, wantReferenceCount: 2},
 	}
 	for _, test := range tests {
@@ -1661,11 +1684,13 @@ func TestVideoTraceAttributesAreRedactedAndDescribeAssetBinding(t *testing.T) {
 				AspectRatio: "16:9",
 				Resolution:  "720p",
 			}
-			if test.wantMode == "imageToVideo" {
+			if len(test.referenceAssets) > 0 {
+				request.ReferenceURLs = make([]string, len(test.referenceAssets))
+				for index := range request.ReferenceURLs {
+					request.ReferenceURLs[index] = "data:image/jpeg;base64,redacted-test-input"
+				}
+			} else if test.wantMode == "imageToVideo" {
 				request.ImageURL = "data:image/jpeg;base64,redacted-test-input"
-			}
-			if test.wantMode == "referenceToVideo" {
-				request.ReferenceURLs = []string{"data:image/jpeg;base64,redacted-test-input"}
 			}
 			attributes := videoTraceAttributes(request, test.firstFrameAsset, test.referenceAssets)
 			if attributes["mode"] != test.wantMode || attributes["input_asset_count"] != test.wantInputCount ||
@@ -1787,6 +1812,67 @@ func TestGenerateVideoUploadsReferenceImagesAndUsesReferenceToVideo(t *testing.T
 	}
 	if !slices.Equal(sequence, wantSequence) {
 		t.Fatalf("request sequence = %#v, want %#v", sequence, wantSequence)
+	}
+}
+
+func TestGenerateVideoUploadsSingleReferenceAndUsesImageToVideo(t *testing.T) {
+	var uploads int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/http/upload-file-v2/direct":
+			uploads++
+			if err := request.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("parse upload: %v", err)
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"fileMetadata":{"fileMetadataId":"reference-1"}}`)
+		case "/rest/media/collection/list":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"collections":[]}`)
+		case "/rest/assets/reference-1":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"assetId":"reference-1"}`)
+		case "/rest/app-chat/conversations/new":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode video payload: %v", err)
+			}
+			mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
+			if _, exists := mediaGenInput["referenceToVideo"]; exists {
+				t.Errorf("single reference used referenceToVideo: %#v", mediaGenInput)
+			}
+			imageToVideo, _ := mediaGenInput["imageToVideo"].(map[string]any)
+			assets, _ := imageToVideo["inputAssets"].([]any)
+			if len(assets) != 1 || assets[0] != "reference-1" || imageToVideo["mode"] != "custom" || imageToVideo["prompt"] != "animate" || imageToVideo["aspectRatio"] != "2:3" || imageToVideo["duration"] != float64(6) || imageToVideo["resolutionName"] != "720p" {
+				t.Errorf("imageToVideo = %#v", imageToVideo)
+			}
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, `data: {"result":{"response":{"userResponse":{"fileAttachments":["reference-1"]}}}}`+"\n"+`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedToken, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test", VideoTimeoutSeconds: 5}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	result, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Credential:    account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
+		Prompt:        "animate",
+		Duration:      6,
+		AspectRatio:   "2:3",
+		Resolution:    "720p",
+		ReferenceURLs: []string{"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+E1fR0QAAAABJRU5ErkJggg=="},
+	})
+	if err != nil || result.URL != "https://assets.grok.com/videos/final.mp4" || uploads != 1 {
+		t.Fatalf("result=%#v uploads=%d err=%v", result, uploads, err)
 	}
 }
 
