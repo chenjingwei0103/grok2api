@@ -49,7 +49,7 @@ FROM alpine:${ALPINE_VERSION}
 ENV TZ=Asia/Shanghai \
     GROK2API_CONFIG_SOURCE=/run/grok2api/config.yaml
 
-RUN apk add --no-cache ca-certificates su-exec tzdata wget && \
+RUN apk add --no-cache ca-certificates ffmpeg su-exec tzdata wget && \
     addgroup -S -g 10001 grok2api && \
     adduser -S -D -H -u 10001 -G grok2api grok2api && \
     mkdir -p /app/data /run/grok2api /var/lib/grok2api-quality-guard && \

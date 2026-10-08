@@ -215,6 +215,7 @@ type Service struct {
 	requestTimeout              atomic.Int64
 	mediaJobs                   repository.MediaJobRepository
 	mediaAssets                 videoAssetStore
+	videoQualityInspector       videoQualityInspector
 	mediaQueue                  chan string
 	mediaMu                     sync.Mutex
 	mediaQueued                 map[string]struct{}

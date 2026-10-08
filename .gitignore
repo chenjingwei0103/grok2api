@@ -23,6 +23,8 @@ Thumbs.db
 
 # Runtime data
 /data/
+/data/quality-guard/upstream-packets/
+/data/quality-guard/video-evidence/
 /backend/data/
 *.log
 

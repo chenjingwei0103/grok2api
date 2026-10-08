@@ -484,6 +484,58 @@ func TestPersistRemoteVideoRetriesSameResultWithoutRegeneration(t *testing.T) {
 	}
 }
 
+func TestPersistRemoteVideoRejectsWrongOrientationBeforeSaving(t *testing.T) {
+	adapter := &videoPersistAdapter{}
+	store := &videoAssetStoreStub{}
+	service := &Service{
+		mediaAssets: store,
+		videoQualityInspector: videoQualityInspectorFunc(func(context.Context, string) (videoQualityProbe, error) {
+			return videoQualityProbe{Width: 1280, Height: 720}, nil
+		}),
+	}
+	credential := account.Credential{ID: 42, Provider: account.ProviderWeb}
+	_, err := service.persistRemoteVideo(
+		context.Background(),
+		"video_job",
+		adapter,
+		credential,
+		provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"},
+		videoQualitySpec{AspectRatio: "9:16"},
+	)
+	if !isVideoQualityError(err) {
+		t.Fatalf("persist error = %v, want quality error", err)
+	}
+	if store.saveCalls != 0 {
+		t.Fatalf("wrong-orientation video was saved %d times", store.saveCalls)
+	}
+}
+
+func TestPersistRemoteVideoSavesWhenQualityProbeIsUnavailable(t *testing.T) {
+	adapter := &videoPersistAdapter{}
+	store := &videoAssetStoreStub{}
+	service := &Service{
+		mediaAssets: store,
+		videoQualityInspector: videoQualityInspectorFunc(func(context.Context, string) (videoQualityProbe, error) {
+			return videoQualityProbe{}, errors.New("ffprobe unavailable")
+		}),
+	}
+	credential := account.Credential{ID: 42, Provider: account.ProviderWeb}
+	result, err := service.persistRemoteVideo(
+		context.Background(),
+		"video_job",
+		adapter,
+		credential,
+		provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"},
+		videoQualitySpec{AspectRatio: "9:16"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.saveCalls != 1 || result.AssetID != "vid_local" {
+		t.Fatalf("quality probe fallback save=%d result=%#v", store.saveCalls, result)
+	}
+}
+
 func TestResolveVideoInputFileReferenceToDataURI(t *testing.T) {
 	raw := []byte("png-bytes")
 	inputID := "input_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -780,6 +832,36 @@ type videoCreateFailoverAdapter struct {
 	attempts []uint64
 }
 
+type videoQualityFailoverAdapter struct {
+	mu       sync.Mutex
+	attempts []uint64
+}
+
+func (a *videoQualityFailoverAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (a *videoQualityFailoverAdapter) Definition() provider.Definition {
+	definition := testConversationDefinition(account.ProviderWeb)
+	definition.Media.VideoGeneration = true
+	return definition
+}
+
+func (a *videoQualityFailoverAdapter) GenerateVideo(_ context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	return provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"}, nil
+}
+
+func (a *videoQualityFailoverAdapter) DownloadVideo(context.Context, account.Credential, string) (io.ReadCloser, string, int64, error) {
+	return io.NopCloser(strings.NewReader("video")), "video/mp4", 5, nil
+}
+
+func (a *videoQualityFailoverAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
+}
+
 func (a *videoCreateFailoverAdapter) Provider() account.Provider { return account.ProviderWeb }
 
 func (a *videoCreateFailoverAdapter) Definition() provider.Definition {
@@ -931,5 +1013,105 @@ func TestVideoWebForbiddenRetriesSameAccountOnceThenFails(t *testing.T) {
 	}
 	if stored.Status != media.StatusFailed || stored.AccountID != first.ID {
 		t.Fatalf("unclassified failed job = %#v", stored)
+	}
+}
+
+func TestVideoQualityFailureSwitchesSixReplacementAccountsThenFails(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-quality-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	mediaRepo := relational.NewMediaJobRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "video-quality", Prefix: "video-quality", SecretHash: strings.Repeat("b", 64),
+		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createAccount := func(index int) account.Credential {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+			Name: fmt.Sprintf("quality-%d", index), SourceKey: fmt.Sprintf("quality-%d", index), EncryptedAccessToken: fmt.Sprintf("quality-%d-token", index),
+			ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		return credential
+	}
+	accounts := make([]account.Credential, 0, videoQualityAccountSwitches+1)
+	for index := 0; index <= videoQualityAccountSwitches; index++ {
+		accounts = append(accounts, createAccount(index))
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-imagine-video"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range accounts {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-imagine-video"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	route, err := modelRepo.GetByProviderUpstream(ctx, account.ProviderWeb, "grok-imagine-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &videoQualityFailoverAdapter{}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, nil, 1)
+	service.ConfigureMedia(mediaRepo, 1)
+	service.ConfigureMediaAssets(&videoAssetStoreStub{})
+	service.UpdateVideoMaxAttempts(1)
+	service.videoQualityInspector = videoQualityInspectorFunc(func(context.Context, string) (videoQualityProbe, error) {
+		return videoQualityProbe{Width: 1280, Height: 720}, nil
+	})
+
+	now := time.Now().UTC()
+	job := media.Job{
+		ID: "video_quality_retry", RequestID: "request-video-quality", ClientKeyID: key.ID, ClientKeyName: key.Name,
+		AccountID: accounts[0].ID, AccountName: accounts[0].Name, Provider: string(account.ProviderWeb),
+		Model: route.PublicID, ModelRouteID: route.ID, UpstreamModel: route.UpstreamModel,
+		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 5, Size: "9:16", Quality: "720p",
+		Status: media.StatusInProgress, InputJSON: "{}", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := mediaRepo.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	service.runVideoJob(ctx, job, route)
+
+	attempts := adapter.Attempts()
+	if len(attempts) != videoQualityAccountSwitches+1 {
+		t.Fatalf("quality attempts = %#v, want %d", attempts, videoQualityAccountSwitches+1)
+	}
+	if attempts[0] != accounts[0].ID {
+		t.Fatalf("first quality attempt = %d, want pinned %d", attempts[0], accounts[0].ID)
+	}
+	seen := make(map[uint64]bool, len(attempts))
+	for _, accountID := range attempts {
+		if seen[accountID] {
+			t.Fatalf("quality retry reused account %d in %#v", accountID, attempts)
+		}
+		seen[accountID] = true
+	}
+	stored, err := mediaRepo.GetMediaJob(ctx, job.ID, job.ClientKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != media.StatusFailed || stored.ErrorCode != ErrorQualityDegraded {
+		t.Fatalf("quality failed job = %#v", stored)
 	}
 }

@@ -525,6 +525,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	case provider.VideoOperationExtend:
 		aspectRatio, resolution = "", ""
 	}
+	qualitySpec := newVideoQualitySpec(aspectRatio, imageURL, referenceURLs)
 
 	quotaMode := videoQuotaMode(route.Provider, s.providers.QuotaMode(route.Provider, route.UpstreamModel), job.Quality)
 	quotaRefreshGroup := s.providers.QuotaRefreshGroup(route.Provider, route.UpstreamModel)
@@ -545,8 +546,9 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}()
 	var result provider.VideoResult
 	var lastErr error
+	qualityFailures := 0
 
-	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
+	for attempt := 0; attemptPolicy.allows(attempt) || (qualityFailures > 0 && qualityFailures <= videoQualityAccountSwitches); attempt++ {
 		attemptStarted := time.Now()
 		err = nil
 		if lease != nil {
@@ -604,8 +606,20 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			_ = s.mediaJobs.UpdateMediaJob(ctx, job)
 		}
 
+		attemptTrace := &videoUpstreamTrace{
+			JobID:                job.ID,
+			GenerationAttempt:    attempt + 1,
+			AccountID:            lease.Credential.ID,
+			Provider:             string(lease.Credential.Provider),
+			Model:                route.UpstreamModel,
+			InputMode:            videoInputMode(imageURL, referenceURLs),
+			ReferenceCount:       countVideoReferences(referenceURLs),
+			Resolution:           resolution,
+			RequestedAspectRatio: aspectRatio,
+		}
+		attemptCtx := withVideoUpstreamTrace(ctx, attemptTrace)
 		lastProgress := job.Progress
-		result, err = adapter.GenerateVideo(ctx, provider.VideoRequest{
+		result, err = adapter.GenerateVideo(attemptCtx, provider.VideoRequest{
 			Credential: lease.Credential, Billing: lease.Billing, JobID: job.ID, Model: route.UpstreamModel,
 			Operation: operation,
 			Prompt:    job.Prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
@@ -624,8 +638,15 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				updateCancel()
 			},
 		})
+		attemptTrace.ResultURL = result.URL
+		attemptTrace.ResultAssetID = result.AssetID
+		if err != nil {
+			s.logVideoUpstream("video_generation_attempt_failed", attemptTrace)
+		} else {
+			s.logVideoUpstream("video_generation_attempt_completed", attemptTrace)
+		}
 		if err == nil && result.AssetID == "" && result.URL != "" {
-			result, err = s.persistRemoteVideo(ctx, job.ID, adapter, lease.Credential, result)
+			result, err = s.persistRemoteVideo(attemptCtx, job.ID, adapter, lease.Credential, result, qualitySpec)
 		}
 		if err == nil {
 			break
@@ -638,6 +659,23 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		}
 
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
+		if isVideoQualityError(err) {
+			qualityFailures++
+			if markErr := s.selector.MarkFailureAfterSuccess(failureCtx, lease.Credential, 0, 0); markErr != nil && s.logger != nil {
+				s.logger.Warn("video_quality_penalty_failed", "job_id", job.ID, "account_id", lease.Credential.ID, "error", markErr)
+			}
+			failureCancel()
+			applyMediaJobEgress(&job, egressTrace, route.Provider)
+			s.logVideoGenerationFailure(job, lease.Credential, err)
+			if videoQualityCanSwitchAccount(qualityFailures) {
+				if s.logger != nil {
+					s.logger.Warn("video_quality_retry", "job_id", job.ID, "account_id", lease.Credential.ID, "quality_failure", qualityFailures, "remaining_account_switches", videoQualityAccountSwitches-qualityFailures)
+				}
+				continue
+			}
+			s.failVideoJob(parent, job, ErrorQualityDegraded, err, 0, failureAttempts.snapshot())
+			return
+		}
 		failureHandled := false
 		retriableCreate := false
 		limitedAccountSwitch := false
@@ -935,7 +973,7 @@ func addVideoReferenceBytes(total *int64, referenceBytes int64) bool {
 
 // persistRemoteVideo 只重试已经生成的视频结果下载与本地归档，不重新调用生成接口，
 // 且所有尝试固定使用创建任务的同一凭据。
-func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter provider.VideoAdapter, credential account.Credential, result provider.VideoResult) (provider.VideoResult, error) {
+func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter provider.VideoAdapter, credential account.Credential, result provider.VideoResult, qualitySpecs ...videoQualitySpec) (provider.VideoResult, error) {
 	if s.mediaAssets == nil {
 		return result, provider.NewMediaPostProcessingError(provider.MediaPostProcessingStorage, errors.New("视频媒体存储未配置"))
 	}
@@ -943,20 +981,38 @@ func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter 
 	if !ok {
 		return result, provider.NewMediaPostProcessingError(provider.MediaPostProcessingDownload, errors.New("Provider 不支持视频内容下载"))
 	}
+	qualitySpec := videoQualitySpec{}
+	if len(qualitySpecs) > 0 {
+		qualitySpec = qualitySpecs[0]
+	}
+	ctx, trace := s.bindVideoDownloadTrace(ctx, jobID, credential, result, qualitySpec)
 	var lastErr error
 	for attempt := 0; attempt < videoOutputAttempts; attempt++ {
-		body, contentType, _, downloadErr := downloader.DownloadVideo(ctx, credential, result.URL)
+		body, contentType, declaredBytes, downloadErr := downloader.DownloadVideo(ctx, credential, result.URL)
+		trace.DownloadAttempt = attempt + 1
+		trace.DownloadDeclaredBytes = declaredBytes
+		trace.DownloadContentType = contentType
 		if downloadErr != nil {
 			lastErr = provider.NewMediaPostProcessingError(provider.MediaPostProcessingDownload, downloadErr)
+			s.logVideoUpstream("video_download_failed", trace)
 		} else {
-			asset, saveErr := s.mediaAssets.SaveVideo(ctx, jobID, contentType, body)
+			asset, saveErr := s.saveVideoWithQuality(ctx, jobID, contentType, body, qualitySpec)
 			_ = body.Close()
 			if saveErr == nil {
 				result.AssetID = asset.ID
 				result.ContentType = asset.MIMEType
+				trace.ResultAssetID = asset.ID
+				if asset.SizeBytes > 0 {
+					trace.ActualCachedBytes = asset.SizeBytes
+				}
+				s.logVideoUpstream("video_download_saved", trace)
 				return result, nil
 			}
+			if isVideoQualityError(saveErr) {
+				return result, saveErr
+			}
 			lastErr = provider.NewMediaPostProcessingError(provider.MediaPostProcessingStorage, saveErr)
+			s.logVideoUpstream("video_download_failed", trace)
 		}
 		if ctx.Err() != nil || attempt+1 >= videoOutputAttempts {
 			break
