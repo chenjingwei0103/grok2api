@@ -994,7 +994,7 @@ func defaultConfig() Config {
 			MinimumGenerationWindow: Duration(time.Second), RotationTimeout: Duration(45 * time.Second),
 			RequestRetry: QualityGuardRequestRetryConfig{
 				Enabled:     true,
-				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
+				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 32, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
 				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4, MaxOutputTokensPerSecond: 500,
 				Trace: QualityGuardRequestRetryTraceConfig{InputMaxBytes: 4096, OutputMaxBytes: 8192},

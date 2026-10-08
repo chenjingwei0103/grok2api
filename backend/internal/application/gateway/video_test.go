@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -484,58 +486,6 @@ func TestPersistRemoteVideoRetriesSameResultWithoutRegeneration(t *testing.T) {
 	}
 }
 
-func TestPersistRemoteVideoRejectsWrongOrientationBeforeSaving(t *testing.T) {
-	adapter := &videoPersistAdapter{}
-	store := &videoAssetStoreStub{}
-	service := &Service{
-		mediaAssets: store,
-		videoQualityInspector: videoQualityInspectorFunc(func(context.Context, string) (videoQualityProbe, error) {
-			return videoQualityProbe{Width: 1280, Height: 720}, nil
-		}),
-	}
-	credential := account.Credential{ID: 42, Provider: account.ProviderWeb}
-	_, err := service.persistRemoteVideo(
-		context.Background(),
-		"video_job",
-		adapter,
-		credential,
-		provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"},
-		videoQualitySpec{AspectRatio: "9:16"},
-	)
-	if !isVideoQualityError(err) {
-		t.Fatalf("persist error = %v, want quality error", err)
-	}
-	if store.saveCalls != 0 {
-		t.Fatalf("wrong-orientation video was saved %d times", store.saveCalls)
-	}
-}
-
-func TestPersistRemoteVideoSavesWhenQualityProbeIsUnavailable(t *testing.T) {
-	adapter := &videoPersistAdapter{}
-	store := &videoAssetStoreStub{}
-	service := &Service{
-		mediaAssets: store,
-		videoQualityInspector: videoQualityInspectorFunc(func(context.Context, string) (videoQualityProbe, error) {
-			return videoQualityProbe{}, errors.New("ffprobe unavailable")
-		}),
-	}
-	credential := account.Credential{ID: 42, Provider: account.ProviderWeb}
-	result, err := service.persistRemoteVideo(
-		context.Background(),
-		"video_job",
-		adapter,
-		credential,
-		provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"},
-		videoQualitySpec{AspectRatio: "9:16"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if store.saveCalls != 1 || result.AssetID != "vid_local" {
-		t.Fatalf("quality probe fallback save=%d result=%#v", store.saveCalls, result)
-	}
-}
-
 func TestResolveVideoInputFileReferenceToDataURI(t *testing.T) {
 	raw := []byte("png-bytes")
 	inputID := "input_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -833,8 +783,9 @@ type videoCreateFailoverAdapter struct {
 }
 
 type videoQualityFailoverAdapter struct {
-	mu       sync.Mutex
-	attempts []uint64
+	mu            sync.Mutex
+	attempts      []uint64
+	downloadCalls int
 }
 
 func (a *videoQualityFailoverAdapter) Provider() account.Provider { return account.ProviderWeb }
@@ -849,10 +800,19 @@ func (a *videoQualityFailoverAdapter) GenerateVideo(_ context.Context, request p
 	a.mu.Lock()
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.mu.Unlock()
-	return provider.VideoResult{URL: "https://assets.grok.com/video.mp4", ContentType: "video/mp4"}, nil
+	return provider.VideoResult{
+		URL:         "https://assets.grok.com/video.mp4",
+		ContentType: "video/mp4",
+		UpstreamMetadata: provider.VideoUpstreamMetadata{
+			StreamObserved: true,
+		},
+	}, nil
 }
 
 func (a *videoQualityFailoverAdapter) DownloadVideo(context.Context, account.Credential, string) (io.ReadCloser, string, int64, error) {
+	a.mu.Lock()
+	a.downloadCalls++
+	a.mu.Unlock()
 	return io.NopCloser(strings.NewReader("video")), "video/mp4", 5, nil
 }
 
@@ -860,6 +820,12 @@ func (a *videoQualityFailoverAdapter) Attempts() []uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]uint64(nil), a.attempts...)
+}
+
+func (a *videoQualityFailoverAdapter) DownloadCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.downloadCalls
 }
 
 func (a *videoCreateFailoverAdapter) Provider() account.Provider { return account.ProviderWeb }
@@ -1018,6 +984,9 @@ func TestVideoWebForbiddenRetriesSameAccountOnceThenFails(t *testing.T) {
 
 func TestVideoQualityFailureSwitchesSixReplacementAccountsThenFails(t *testing.T) {
 	ctx := context.Background()
+	evidenceRoot := t.TempDir()
+	t.Setenv("GROK2API_QUALITY_GUARD_DIR", evidenceRoot)
+	t.Setenv(videoQualityEvidenceEnabledEnv, "true")
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-quality-retry.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1074,11 +1043,9 @@ func TestVideoQualityFailureSwitchesSixReplacementAccountsThenFails(t *testing.T
 	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
 	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, nil, 1)
 	service.ConfigureMedia(mediaRepo, 1)
-	service.ConfigureMediaAssets(&videoAssetStoreStub{})
+	assetStore := &videoAssetStoreStub{}
+	service.ConfigureMediaAssets(assetStore)
 	service.UpdateVideoMaxAttempts(1)
-	service.videoQualityInspector = videoQualityInspectorFunc(func(context.Context, string) (videoQualityProbe, error) {
-		return videoQualityProbe{Width: 1280, Height: 720}, nil
-	})
 
 	now := time.Now().UTC()
 	job := media.Job{
@@ -1096,6 +1063,38 @@ func TestVideoQualityFailureSwitchesSixReplacementAccountsThenFails(t *testing.T
 	attempts := adapter.Attempts()
 	if len(attempts) != videoQualityAccountSwitches+1 {
 		t.Fatalf("quality attempts = %#v, want %d", attempts, videoQualityAccountSwitches+1)
+	}
+	if downloads := adapter.DownloadCalls(); downloads != videoQualityAccountSwitches+1 {
+		t.Fatalf("quality evidence downloads = %d, want %d", downloads, videoQualityAccountSwitches+1)
+	}
+	if assetStore.saveCalls != 0 {
+		t.Fatalf("quality evidence must not write the normal media store, save calls = %d", assetStore.saveCalls)
+	}
+	evidenceDir := filepath.Join(evidenceRoot, "rejected-videos", job.ID)
+	entries, err := os.ReadDir(evidenceDir)
+	if err != nil {
+		t.Fatalf("read quality evidence directory: %v", err)
+	}
+	if len(entries) != (videoQualityAccountSwitches+1)*2 {
+		t.Fatalf("quality evidence files = %d, want %d", len(entries), (videoQualityAccountSwitches+1)*2)
+	}
+	for attempt := 1; attempt <= videoQualityAccountSwitches+1; attempt++ {
+		videoPath := filepath.Join(evidenceDir, fmt.Sprintf("attempt-%03d.mp4", attempt))
+		if data, readErr := os.ReadFile(videoPath); readErr != nil || string(data) != "video" {
+			t.Fatalf("quality evidence video %q = %q, err = %v", videoPath, data, readErr)
+		}
+		metadataPath := filepath.Join(evidenceDir, fmt.Sprintf("attempt-%03d.json", attempt))
+		metadataBytes, readErr := os.ReadFile(metadataPath)
+		if readErr != nil {
+			t.Fatalf("read quality evidence metadata %q: %v", metadataPath, readErr)
+		}
+		metadata := map[string]any{}
+		if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+			t.Fatalf("decode quality evidence metadata %q: %v", metadataPath, err)
+		}
+		if metadata["job_id"] != job.ID || metadata["generation_attempt"] != float64(attempt) || metadata["moderated_present"] != false {
+			t.Fatalf("quality evidence metadata %q = %#v", metadataPath, metadata)
+		}
 	}
 	if attempts[0] != accounts[0].ID {
 		t.Fatalf("first quality attempt = %d, want pinned %d", attempts[0], accounts[0].ID)

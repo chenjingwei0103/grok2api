@@ -1,133 +1,107 @@
-package gateway
+﻿package gateway
 
 import (
-	"bytes"
 	"encoding/json"
 	"testing"
 )
 
-func TestAppendQuestionForRepeatedToolCallResponses(t *testing.T) {
+func TestAppendContinueForTrailingToolLoopAppendsAfterThreeEquivalentCalls(t *testing.T) {
 	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"check status"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"E:/grok2api2"}]}`)
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect the repository"},{"type":"function_call","call_id":"call_1","name":"run_terminal_command","arguments":"{ \"path\": \"E:/grok2api2\", \"cmd\": \"git status --short\" }"},{"type":"function_call_output","call_id":"call_1","output":" M service.go"},{"type":"function_call","call_id":"call_2","name":"run_terminal_command","arguments":"{\"cmd\":\"git status --short\",\"path\":\"E:/grok2api2\"}"},{"type":"function_call_output","call_id":"call_2","output":" M service.go"},{"type":"function_call","call_id":"call_3","name":"run_terminal_command","arguments":"{\"path\":\"E:/grok2api2\",\"cmd\":\"git status --short\"}"},{"type":"function_call_output","call_id":"call_3","output":" M service.go"}]}`)
 
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if !repeated {
-		t.Fatal("expected repeated tool call to be detected")
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if !evidence.Detected {
+		t.Fatal("three identical trailing completed calls must be detected")
 	}
+	if evidence.ConsecutiveCount != 3 {
+		t.Fatalf("consecutive count = %d, want 3", evidence.ConsecutiveCount)
+	}
+	if evidence.ToolName != "run_terminal_command" || evidence.ArgumentsHash == "" || evidence.OutputHash == "" {
+		t.Fatalf("evidence = %#v", evidence)
+	}
+	assertTrailingContinue(t, got)
+}
+
+func TestAppendContinueForTrailingToolLoopDoesNotAppendForTwoCalls(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"E:/grok2api2"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if evidence.Detected {
+		t.Fatalf("two repeated calls must not be detected: %#v", evidence)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("body changed without a loop: %s", got)
+	}
+}
+
+func TestAppendContinueForTrailingToolLoopRequiresSameOutput(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"file-a"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_2","output":"file-a\nfile-b"},{"type":"function_call","call_id":"call_3","name":"bash","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_3","output":"file-a\nfile-b\nfile-c"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if evidence.Detected {
+		t.Fatalf("changed output must break the loop: %#v", evidence)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("body changed without a loop: %s", got)
+	}
+}
+
+func TestAppendContinueForTrailingToolLoopResetsAfterImageUserTurn(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"first"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_3","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_3","output":"E:/grok2api2"},{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.test/image.png"}]},{"type":"function_call","call_id":"call_4","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_4","output":"E:/grok2api2"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if evidence.Detected {
+		t.Fatalf("a new image user turn must reset the loop: %#v", evidence)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("body changed after a new user turn: %s", got)
+	}
+}
+
+func TestAppendContinueForTrailingToolLoopIgnoresReasoningItems(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect"},{"type":"reasoning","summary":[]},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"E:/grok2api2"},{"type":"reasoning","summary":[]},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"E:/grok2api2"},{"type":"reasoning","summary":[]},{"type":"function_call","call_id":"call_3","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_3","output":"E:/grok2api2"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if !evidence.Detected {
+		t.Fatalf("reasoning items must not break an otherwise repeated tool tail: %#v", evidence)
+	}
+	assertTrailingContinue(t, got)
+}
+
+func TestAppendContinueForTrailingToolLoopRequiresCompletedTail(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_3","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_3","output":"E:/grok2api2"},{"type":"function_call","call_id":"call_4","name":"bash","arguments":"{\"cmd\":\"pwd\"}"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if evidence.Detected {
+		t.Fatalf("an incomplete trailing call must not reuse an earlier hit: %#v", evidence)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("body changed with an incomplete trailing call: %s", got)
+	}
+}
+
+func assertTrailingContinue(t *testing.T, body []byte) {
+	t.Helper()
 	var root struct {
-		Input []map[string]any `json:"input"`
+		Input []struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"input"`
 	}
-	if err := json.Unmarshal(got, &root); err != nil {
+	if err := json.Unmarshal(body, &root); err != nil {
 		t.Fatal(err)
 	}
-	if len(root.Input) != 6 {
-		t.Fatalf("input length = %d, want 6", len(root.Input))
+	if len(root.Input) == 0 {
+		t.Fatal("missing input")
 	}
 	last := root.Input[len(root.Input)-1]
-	if last["type"] != "message" || last["role"] != "user" || last["content"] != "continue" {
-		t.Fatalf("appended item = %#v", last)
-	}
-}
-
-func TestAppendQuestionForRepeatedToolCallRequiresNoNewUserMessage(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"first"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"one"},{"type":"message","role":"user","content":"new question"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"one"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if repeated {
-		t.Fatal("a new user message must reset duplicate detection")
-	}
-	if string(got) != string(body) {
-		t.Fatalf("body changed without duplicate: %s", got)
-	}
-}
-
-func TestAppendQuestionForRepeatedToolCallIgnoresChangedOutput(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"check files"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_1","output":"file-a"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"ls\"}"},{"type":"function_call_output","call_id":"call_2","output":"file-a\nfile-b"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if repeated {
-		t.Fatal("changed tool output must not be treated as an exact duplicate")
-	}
-	if string(got) != string(body) {
-		t.Fatalf("body changed without duplicate: %s", got)
-	}
-}
-
-func TestAppendQuestionForRepeatedToolCallCanonicalizesJSONArguments(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"check"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{ \"path\": \"x\", \"cmd\": \"pwd\" }"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\",\"path\":\"x\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if !repeated {
-		t.Fatal("JSON-equivalent arguments must be treated as the same tool call")
-	}
-	if !bytes.Contains(got, []byte(`"content":"continue"`)) {
-		t.Fatalf("appended question missing from body: %s", got)
-	}
-}
-
-func TestAppendQuestionForRepeatedToolCallDoesNotAppendTwice(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"check"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"},{"type":"message","role":"user","content":"continue"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if repeated {
-		t.Fatal("an already appended question must not trigger another append")
-	}
-	if string(got) != string(body) {
-		t.Fatalf("body changed after existing question marker: %s", got)
-	}
-}
-
-func TestAppendQuestionForRepeatedToolCallResetsAfterNewUserTurn(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"continue"},{"type":"message","role":"user","content":"new turn"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if !repeated {
-		t.Fatal("an earlier question marker must not suppress a later user turn")
-	}
-	var root struct {
-		Input []map[string]any `json:"input"`
-	}
-	if err := json.Unmarshal(got, &root); err != nil {
-		t.Fatal(err)
-	}
-	if len(root.Input) != 7 || root.Input[len(root.Input)-1]["content"] != "continue" {
-		t.Fatalf("appended input = %#v", root.Input)
-	}
-}
-
-func TestAppendQuestionForRepeatedCustomToolCall(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"apply the change"},{"type":"custom_tool_call","call_id":"call_1","name":"apply_patch","input":"patch"},{"type":"custom_tool_call_output","call_id":"call_1","output":"done"},{"type":"custom_tool_call","call_id":"call_2","name":"apply_patch","input":"patch"},{"type":"custom_tool_call_output","call_id":"call_2","output":"done"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if !repeated {
-		t.Fatal("expected repeated custom tool call to be detected")
-	}
-	var root struct {
-		Input []map[string]any `json:"input"`
-	}
-	if err := json.Unmarshal(got, &root); err != nil {
-		t.Fatal(err)
-	}
-	if len(root.Input) != 6 || root.Input[len(root.Input)-1]["content"] != "continue" {
-		t.Fatalf("appended input = %#v", root.Input)
-	}
-}
-
-func TestAppendQuestionForRepeatedToolCallTreatsImageOnlyUserMessageAsNewTurn(t *testing.T) {
-	t.Parallel()
-	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"first"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"same"},{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.test/image.png"}]},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_2","output":"same"}]}`)
-
-	got, repeated := appendQuestionForRepeatedToolCall(body)
-	if repeated {
-		t.Fatal("an image-only user message must reset duplicate detection")
-	}
-	if string(got) != string(body) {
-		t.Fatalf("body changed without duplicate: %s", got)
+	if last.Type != "message" || last.Role != "user" || last.Content != toolLoopBreakoutInstruction {
+		t.Fatalf("trailing input = %#v, want user continue", last)
 	}
 }

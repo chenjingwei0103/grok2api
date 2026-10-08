@@ -215,7 +215,6 @@ type Service struct {
 	requestTimeout              atomic.Int64
 	mediaJobs                   repository.MediaJobRepository
 	mediaAssets                 videoAssetStore
-	videoQualityInspector       videoQualityInspector
 	mediaQueue                  chan string
 	mediaMu                     sync.Mutex
 	mediaQueued                 map[string]struct{}
@@ -1075,9 +1074,16 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if strippedSchemaToolCalls > 0 {
 		s.logger.Info("schema_index_tool_calls_stripped", "request_id", input.RequestID, "removed", strippedSchemaToolCalls)
 	}
-	if updatedBody, repeatedToolCall := appendQuestionForRepeatedToolCall(upstreamBody); repeatedToolCall {
-		upstreamBody = updatedBody
-		s.logger.Info("repeated_tool_call_question_appended", "request_id", input.RequestID, "marker", "continue")
+	upstreamBody, toolLoopEvidence := appendContinueForTrailingToolLoop(upstreamBody)
+	if toolLoopEvidence.Detected {
+		s.logger.Info(
+			"repeated_tool_loop_continue_injected",
+			"request_id", input.RequestID,
+			"tool", toolLoopEvidence.ToolName,
+			"arguments_hash", toolLoopEvidence.ArgumentsHash,
+			"output_hash", toolLoopEvidence.OutputHash,
+			"consecutive", toolLoopEvidence.ConsecutiveCount,
+		)
 	}
 	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
@@ -1718,6 +1724,13 @@ attemptLoop:
 					ReasoningEffort: auditBase.ReasoningEffort, ClientSource: qualityClientSource, QualityAttempt: qualityAccountAttempts,
 					Verdict: peek.verdict, Action: string(commit.Action), Retry: holdCfg, Capture: peek.capture,
 					Egress: snapshotQualityTraceEgress(credential, egressTrace, route.Provider), UpstreamURL: response.UpstreamURL,
+				}
+				if signals := peek.capture.signals(); qualityIsShortVisibleNoReasoningHighBilledOutput(signals, holdCfg.MinOutputTokens) {
+					s.logger.Warn("quality_short_visible_no_reasoning_high_billed_output",
+						"request_id", input.RequestID, "account_id", credential.ID, "quality_attempt", qualityAccountAttempts,
+						"visible_tokens", signals.VisibleTokens, "output_tokens", signals.OutputTokens,
+						"reasoning_tokens", signals.ReasoningTokens, "tool_call_seen", signals.ToolCallSeen,
+						"terminal", signals.Terminal, "action", commit.Action)
 				}
 				if peek.verdict == QualityWithhold {
 					captureAbnormalRequest()

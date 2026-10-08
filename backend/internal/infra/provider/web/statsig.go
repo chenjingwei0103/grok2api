@@ -17,6 +17,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/upstreamcapture"
 	"github.com/chenyme/grok2api/backend/internal/pkg/signerurl"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/singleflight"
@@ -61,6 +62,7 @@ func newStatsigSigner() *statsigSigner {
 	return &statsigSigner{
 		client: &http.Client{
 			Timeout:       12 * time.Second,
+			Transport:     upstreamcapture.WrapTransport(nil),
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		fetchMeta:        fetchStatsigMetaContent,

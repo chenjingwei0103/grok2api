@@ -201,6 +201,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		Terminal:                   s.terminal,
 		HoldExpired:                s.holdExpired,
 		OutputTokensPerSecond:      outputTokensPerSecond,
+		ToolCallSeen:               s.toolCallSeen,
 		ToolCallOnly:               s.toolCallSeen && visible <= 0,
 		SchemaIndexToolCall:        s.schemaIndexToolCall,
 		RequireReasoningAfterRetry: s.requireReasoningAfterRetry,

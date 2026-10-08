@@ -690,6 +690,7 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		}
 		stream := nestedMap(root, "result", "response", "streamingVideoGenerationResponse")
 		if stream != nil {
+			result.UpstreamMetadata.StreamObserved = true
 			if value, ok := numberAsInt(stream["progress"]); ok && progress != nil {
 				progress(value)
 			}
@@ -698,18 +699,16 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 			} else if value, _ := stream["videoId"].(string); value != "" {
 				postID = value
 			}
-			moderated, _ := stream["moderated"].(bool)
-			if moderated {
-				return false, nil
+			if rawModerated, present := stream["moderated"]; present {
+				result.UpstreamMetadata.ModeratedPresent = true
+				if moderated, ok := rawModerated.(bool); ok {
+					result.UpstreamMetadata.Moderated = moderated
+				}
 			}
-			if setVideoResultURL(&result, firstString(stream, "videoUrl", "contentUrl", "contentURL", "assetUrl", "assetURL", "fileUri", "fileURL")) {
-				return true, nil
-			}
+			setVideoResultURL(&result, firstString(stream, "videoUrl", "contentUrl", "contentURL", "assetUrl", "assetURL", "fileUri", "fileURL"))
 		}
 		for _, attachment := range videoFileAttachments(root) {
-			if setVideoResultURL(&result, attachment) {
-				return true, nil
-			}
+			setVideoResultURL(&result, attachment)
 		}
 		return false, nil
 	}

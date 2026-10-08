@@ -82,8 +82,8 @@ func TestSegmentedActiveReadsOnlyFirstAvailableWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if lease.Credential.ID != 1 {
-		t.Fatalf("selected account = %d, want 1", lease.Credential.ID)
+	if lease.Credential.ID < 1 || lease.Credential.ID > 8 {
+		t.Fatalf("selected account = %d, want an account in the first window 1-8", lease.Credential.ID)
 	}
 	if sizes := limiter.BatchSizes(); fmt.Sprint(sizes) != "[8]" {
 		t.Fatalf("concurrency batch sizes = %v, want one window", sizes)
@@ -136,15 +136,15 @@ func TestSegmentedActiveRotatesWindowStartPerRoute(t *testing.T) {
 	limiter := newSegmentedSelectiveLimiter()
 	selector := newSegmentedActiveTestSelector(100, limiter, nil)
 	selector.UpdateSegmentedSelector(true, 100, 8)
-	wanted := []uint64{1, 9, 17}
-	for index, expected := range wanted {
+	windows := [][2]uint64{{1, 8}, {9, 16}, {17, 24}}
+	for index, window := range windows {
 		lease, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if lease.Credential.ID != expected {
+		if lease.Credential.ID < window[0] || lease.Credential.ID > window[1] {
 			lease.Release()
-			t.Fatalf("selection %d = %d, want %d", index, lease.Credential.ID, expected)
+			t.Fatalf("selection %d = %d, want an account in window %d-%d", index, lease.Credential.ID, window[0], window[1])
 		}
 		lease.Release()
 	}
@@ -163,8 +163,8 @@ func TestSegmentedActiveContinuesAfterSaturatedWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if lease.Credential.ID != 9 {
-		t.Fatalf("selected account = %d, want 9", lease.Credential.ID)
+	if lease.Credential.ID < 9 || lease.Credential.ID > 16 {
+		t.Fatalf("selected account = %d, want an account in the next window 9-16", lease.Credential.ID)
 	}
 	if sizes := limiter.BatchSizes(); fmt.Sprint(sizes) != "[8 8]" {
 		t.Fatalf("concurrency batch sizes = %v, want two windows", sizes)
@@ -192,8 +192,8 @@ func TestSegmentedActiveExhaustsHigherPriorityCohortBeforeFallingBack(t *testing
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if lease.Credential.ID != 9 {
-		t.Fatalf("selected account = %d, want first lower-priority available account 9", lease.Credential.ID)
+	if lease.Credential.ID < 9 || lease.Credential.ID > 16 {
+		t.Fatalf("selected account = %d, want a lower-priority account in window 9-16", lease.Credential.ID)
 	}
 	if lease.selectorObservation == nil || lease.selectorObservation.stage != "later_cohort" {
 		t.Fatalf("selection stage = %#v", lease.selectorObservation)
@@ -352,8 +352,8 @@ func TestSegmentedActiveFallsBackToFullPlannerAfterBoundedWindows(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if lease.Credential.ID != 33 {
-		t.Fatalf("selected account = %d, want higher-priority full fallback account 33", lease.Credential.ID)
+	if lease.Credential.ID < 33 || lease.Credential.ID > 40 {
+		t.Fatalf("selected account = %d, want a higher-priority unsaturated account 33-40", lease.Credential.ID)
 	}
 	if lease.selectorObservation == nil || lease.selectorObservation.stage != "full_fallback" {
 		t.Fatalf("selection stage = %#v", lease.selectorObservation)

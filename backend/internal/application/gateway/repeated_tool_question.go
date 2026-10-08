@@ -1,55 +1,68 @@
-package gateway
+﻿package gateway
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
 
-// appendQuestionForRepeatedToolCall adds one explicit user continue message to a
-// Responses request when the same completed tool call appears twice without a
-// new user message. The question is intentionally added to the upstream body
-// only; the original client request remains unchanged for audit/replay.
-func appendQuestionForRepeatedToolCall(body []byte) ([]byte, bool) {
+const repeatedToolContinueThreshold = 3
+
+// toolLoopBreakoutInstruction 针对检测到的重复调用死循环注入破局引导提示
+const toolLoopBreakoutInstruction = "Notice: The previous tool call has failed repeatedly with the same output. Please stop repeating this identical command. Inspect the error output carefully, change your syntax, parameters, or approach, or reply directly with an explanation."
+
+// ToolLoopEvidence contains redacted evidence for a repeated tool-call tail.
+// It deliberately stores hashes instead of arguments or tool output.
+type ToolLoopEvidence struct {
+	Detected         bool
+	ToolName         string
+	ArgumentsHash    string
+	OutputHash       string
+	ConsecutiveCount int
+}
+
+// appendContinueForTrailingToolLoop adds one upstream-only continue marker
+// after a genuinely repeated tail of completed tool calls. The client body
+// remains unchanged so the marker cannot become part of the next turn.
+func appendContinueForTrailingToolLoop(body []byte) ([]byte, ToolLoopEvidence) {
 	var root map[string]json.RawMessage
+	var evidence ToolLoopEvidence
 	if len(body) == 0 || json.Unmarshal(body, &root) != nil {
-		return body, false
+		return body, evidence
 	}
 	rawInput, ok := root["input"]
 	if !ok {
-		return body, false
+		return body, evidence
 	}
 	var items []json.RawMessage
 	if json.Unmarshal(rawInput, &items) != nil {
-		return body, false
+		return body, evidence
 	}
-	if !hasRepeatedCompletedToolCall(items) {
-		return body, false
+	evidence = detectTrailingToolLoop(items)
+	if !evidence.Detected {
+		return body, evidence
 	}
-	if hasContinueUserMessage(items) {
-		return body, false
-	}
-	items = append(items, json.RawMessage(`{"type":"message","role":"user","content":"continue"}`))
+	promptJSON, _ := json.Marshal(toolLoopBreakoutInstruction)
+	items = append(items, json.RawMessage(`{"type":"message","role":"user","content":`+string(promptJSON)+`}`))
 	encodedInput, err := json.Marshal(items)
 	if err != nil {
-		return body, false
+		return body, ToolLoopEvidence{}
 	}
 	root["input"] = encodedInput
 	encoded, err := json.Marshal(root)
 	if err != nil {
-		return body, false
+		return body, ToolLoopEvidence{}
 	}
-	return encoded, true
+	return encoded, evidence
 }
 
-type repeatedToolCallRecord struct {
-	name      string
-	arguments string
-}
-
-func hasRepeatedCompletedToolCall(items []json.RawMessage) bool {
+func detectTrailingToolLoop(items []json.RawMessage) ToolLoopEvidence {
+	var evidence ToolLoopEvidence
 	pending := make(map[string]repeatedToolCallRecord)
-	completed := make(map[string]struct{})
+	lastFingerprint := ""
+	consecutive := 0
 	for _, raw := range items {
 		item := decodeRawObject(raw)
 		if item == nil {
@@ -57,7 +70,9 @@ func hasRepeatedCompletedToolCall(items []json.RawMessage) bool {
 		}
 		if isMeaningfulUserInput(item) {
 			pending = make(map[string]repeatedToolCallRecord)
-			completed = make(map[string]struct{})
+			lastFingerprint = ""
+			consecutive = 0
+			evidence = ToolLoopEvidence{}
 			continue
 		}
 		typeName := strings.TrimSpace(rawString(item["type"]))
@@ -65,43 +80,69 @@ func hasRepeatedCompletedToolCall(items []json.RawMessage) bool {
 		case "function_call", "custom_tool_call":
 			callID := strings.TrimSpace(rawString(item["call_id"]))
 			name := strings.TrimSpace(rawString(item["name"]))
-			if callID == "" || name == "" {
+			arguments := canonicalToolJSON(toolCallInput(item, typeName))
+			if callID == "" || name == "" || arguments == "" {
+				pending = make(map[string]repeatedToolCallRecord)
+				lastFingerprint = ""
+				consecutive = 0
+				evidence = ToolLoopEvidence{}
 				continue
 			}
-			pending[callID] = repeatedToolCallRecord{
-				name:      name,
-				arguments: canonicalToolJSON(toolCallInput(item, typeName)),
-			}
+			pending[callID] = repeatedToolCallRecord{name: name, arguments: arguments}
 		case "function_call_output", "custom_tool_call_output":
 			callID := strings.TrimSpace(rawString(item["call_id"]))
 			call, ok := pending[callID]
-			if !ok || call.arguments == "" {
+			if !ok {
+				pending = make(map[string]repeatedToolCallRecord)
+				lastFingerprint = ""
+				consecutive = 0
+				evidence = ToolLoopEvidence{}
 				continue
 			}
-			key := call.name + "\x00" + call.arguments + "\x00" + canonicalToolJSON(item["output"])
-			if _, exists := completed[key]; exists {
-				return true
+			delete(pending, callID)
+			output := canonicalToolJSON(item["output"])
+			fingerprint := call.name + "\x00" + call.arguments + "\x00" + output
+			if fingerprint == lastFingerprint {
+				consecutive++
+			} else {
+				consecutive = 1
+				evidence = ToolLoopEvidence{}
 			}
-			completed[key] = struct{}{}
+			lastFingerprint = fingerprint
+			if consecutive >= repeatedToolContinueThreshold {
+				evidence = ToolLoopEvidence{
+					Detected:         true,
+					ToolName:         call.name,
+					ArgumentsHash:    shortToolLoopHash(call.arguments),
+					OutputHash:       shortToolLoopHash(output),
+					ConsecutiveCount: consecutive,
+				}
+			}
+		case "reasoning":
+			// Reasoning items can be interleaved with a tool call/output pair
+			// in Responses history; they do not make the tool tail non-contiguous.
+			continue
+		default:
+			pending = make(map[string]repeatedToolCallRecord)
+			lastFingerprint = ""
+			consecutive = 0
+			evidence = ToolLoopEvidence{}
 		}
 	}
-	return false
+	if len(pending) > 0 {
+		return ToolLoopEvidence{}
+	}
+	return evidence
 }
 
-func hasContinueUserMessage(items []json.RawMessage) bool {
-	markerInCurrentTurn := false
-	for _, raw := range items {
-		item := decodeRawObject(raw)
-		if item == nil || !isMeaningfulUserInput(item) {
-			continue
-		}
-		if strings.TrimSpace(userInputText(item)) == "continue" {
-			markerInCurrentTurn = true
-			continue
-		}
-		markerInCurrentTurn = false
-	}
-	return markerInCurrentTurn
+func shortToolLoopHash(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])[:16]
+}
+
+type repeatedToolCallRecord struct {
+	name      string
+	arguments string
 }
 
 func isMeaningfulUserInput(item map[string]json.RawMessage) bool {
@@ -129,32 +170,6 @@ func toolCallInput(item map[string]json.RawMessage, typeName string) json.RawMes
 		return item["input"]
 	}
 	return item["arguments"]
-}
-
-func userInputText(item map[string]json.RawMessage) string {
-	raw := bytes.TrimSpace(item["content"])
-	if len(raw) == 0 {
-		return ""
-	}
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return text
-	}
-	var parts []map[string]json.RawMessage
-	if json.Unmarshal(raw, &parts) != nil {
-		return ""
-	}
-	var builder strings.Builder
-	for _, part := range parts {
-		partType := strings.TrimSpace(rawString(part["type"]))
-		switch partType {
-		case "input_text", "text", "output_text":
-			builder.WriteString(rawString(part["text"]))
-		case "refusal":
-			builder.WriteString(rawString(part["refusal"]))
-		}
-	}
-	return builder.String()
 }
 
 func decodeRawObject(raw json.RawMessage) map[string]json.RawMessage {

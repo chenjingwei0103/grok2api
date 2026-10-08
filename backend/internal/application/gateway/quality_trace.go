@@ -231,9 +231,9 @@ func sanitizeQualityTraceJSONValue(value any) (any, bool) {
 		result := make([]any, 0, len(current))
 		redacted := false
 		for _, nested := range current {
-				clean, nestedRedacted := sanitizeQualityTraceJSONValue(nested)
-				result = append(result, clean)
-				redacted = redacted || nestedRedacted
+			clean, nestedRedacted := sanitizeQualityTraceJSONValue(nested)
+			result = append(result, clean)
+			redacted = redacted || nestedRedacted
 		}
 		return result, redacted
 	case string:
@@ -360,11 +360,11 @@ func (value qualityTraceAttemptInput) qualityError() string {
 type qualityTraceEnvelope struct {
 	Kind    string `json:"kind"`
 	Request struct {
-		ID       string `json:"id"`
-		Method   string `json:"method"`
-		Path     string `json:"path"`
-		Streaming bool  `json:"streaming"`
-		Body     struct {
+		ID        string `json:"id"`
+		Method    string `json:"method"`
+		Path      string `json:"path"`
+		Streaming bool   `json:"streaming"`
+		Body      struct {
 			SHA256    string `json:"sha256"`
 			Bytes     int    `json:"bytes"`
 			Preview   string `json:"preview"`
@@ -384,7 +384,7 @@ type qualityTraceEnvelope struct {
 		ID   uint64 `json:"id,omitempty"`
 		Name string `json:"name,omitempty"`
 	} `json:"account"`
-	Egress qualityTraceEgress `json:"egress"`
+	Egress  qualityTraceEgress `json:"egress"`
 	Quality struct {
 		Attempt    int      `json:"attempt"`
 		Verdict    string   `json:"verdict"`
@@ -396,19 +396,22 @@ type qualityTraceEnvelope struct {
 			HoldTimeoutMS            int64   `json:"holdTimeoutMs"`
 		} `json:"thresholds"`
 		Signals struct {
-			HasThinking           bool    `json:"hasThinking"`
-			PlaintextThinking     bool    `json:"plaintextThinking"`
-			ReasoningStarted      bool    `json:"reasoningStarted"`
-			VisibleTokens         int64   `json:"visibleTokens"`
-			OutputTokens          int64   `json:"outputTokens"`
-			ReasoningTokens       int64   `json:"reasoningTokens"`
-			EncryptedBytes        int     `json:"encryptedBytes"`
-			FirstVisible          bool    `json:"firstVisible"`
-			VisibleFlushMS        int64   `json:"visibleFlushMs"`
-			Terminal              bool    `json:"terminal"`
-			HoldExpired           bool    `json:"holdExpired"`
-			ClassifierTPS         float64 `json:"classifierOutputTokensPerSecond"`
-			FullRequestTPS        float64 `json:"fullRequestOutputTokensPerSecond"`
+			HasThinking         bool    `json:"hasThinking"`
+			PlaintextThinking   bool    `json:"plaintextThinking"`
+			ReasoningStarted    bool    `json:"reasoningStarted"`
+			VisibleTokens       int64   `json:"visibleTokens"`
+			OutputTokens        int64   `json:"outputTokens"`
+			ReasoningTokens     int64   `json:"reasoningTokens"`
+			EncryptedBytes      int     `json:"encryptedBytes"`
+			FirstVisible        bool    `json:"firstVisible"`
+			VisibleFlushMS      int64   `json:"visibleFlushMs"`
+			Terminal            bool    `json:"terminal"`
+			HoldExpired         bool    `json:"holdExpired"`
+			ClassifierTPS       float64 `json:"classifierOutputTokensPerSecond"`
+			FullRequestTPS      float64 `json:"fullRequestOutputTokensPerSecond"`
+			ToolCallSeen        bool    `json:"toolCallSeen"`
+			ToolCallOnly        bool    `json:"toolCallOnly"`
+			SchemaIndexToolCall bool    `json:"schemaIndexToolCall"`
 		} `json:"signals"`
 	} `json:"quality"`
 	Timing struct {
@@ -421,16 +424,16 @@ type qualityTraceEnvelope struct {
 		HeldTruncated    bool      `json:"heldTruncated"`
 	} `json:"timing"`
 	Usage struct {
-		Reported      bool  `json:"reported"`
-		InputTokens   int64 `json:"inputTokens"`
-		OutputTokens  int64 `json:"outputTokens"`
+		Reported        bool  `json:"reported"`
+		InputTokens     int64 `json:"inputTokens"`
+		OutputTokens    int64 `json:"outputTokens"`
 		ReasoningTokens int64 `json:"reasoningTokens"`
-		TotalTokens   int64 `json:"totalTokens"`
+		TotalTokens     int64 `json:"totalTokens"`
 	} `json:"usage"`
 	Output struct {
-		VisibleText  string `json:"visibleText"`
-		SourceBytes  int    `json:"sourceBytes"`
-		Truncated    bool   `json:"truncated"`
+		VisibleText string `json:"visibleText"`
+		SourceBytes int    `json:"sourceBytes"`
+		Truncated   bool   `json:"truncated"`
 	} `json:"output"`
 	Truncated bool `json:"truncated"`
 }
@@ -481,6 +484,9 @@ func newQualityTraceEnvelope(input qualityTraceAttemptInput, credential accountd
 	result.Quality.Signals.Terminal = signals.Terminal
 	result.Quality.Signals.HoldExpired = signals.HoldExpired
 	result.Quality.Signals.ClassifierTPS = signals.OutputTokensPerSecond
+	result.Quality.Signals.ToolCallSeen = signals.ToolCallSeen
+	result.Quality.Signals.ToolCallOnly = signals.ToolCallOnly
+	result.Quality.Signals.SchemaIndexToolCall = signals.SchemaIndexToolCall
 	if !state.startedAt.IsZero() && !state.completedAt.IsZero() && signals.OutputTokens > 0 {
 		durationMS := state.completedAt.Sub(state.startedAt).Milliseconds()
 		if durationMS > 0 {
@@ -521,6 +527,9 @@ func qualityTraceReasons(sig QualityStreamSignals, retry QualityRetryRuntime, ve
 	}
 	if verdict == QualityWithhold {
 		reasons := make([]string, 0, 2)
+		if qualityIsShortVisibleNoReasoningHighBilledOutput(sig, retry.MinOutputTokens) {
+			reasons = append(reasons, "short_visible_no_reasoning_high_billed_output")
+		}
 		if qualityIsBurstDump(sig, retry.MinOutputTokens) {
 			reasons = append(reasons, "burst_dump")
 		}

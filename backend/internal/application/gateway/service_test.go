@@ -450,6 +450,71 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 }
 
+func TestGatewayDoesNotSynthesizeContinueForRepeatedToolHistory(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "gateway-repeat-history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "repeat-history", SourceKey: "repeat-history",
+		EncryptedAccessToken: "access", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const model = "grok-repeat-history"
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{model}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{model}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "repeat-history-key", Prefix: "repeat-history-prefix",
+		SecretHash:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		EncryptedSecret: "encrypted-key", Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &failoverAdapter{}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
+	inputBody := []byte("{\"model\":\"grok-repeat-history\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"run once\"},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"same\"},{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_2\",\"output\":\"same\"}]}")
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-no-synthetic-continue", ClientKey: clientKey, PublicModel: model, Body: inputBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(result.Body); err != nil {
+		t.Fatal(err)
+	}
+	if result.Finalize != nil {
+		result.Finalize(Usage{}, "", "")
+	}
+	_ = result.Body.Close()
+
+	if got := string(adapter.LastBody()); strings.Contains(got, "\"content\":\"continue\"") {
+		t.Fatalf("gateway injected a synthetic continue message into upstream body: %s", got)
+	}
+}
+
 func TestQualityProbeForcesObservedNodeForUnboundAccountAndRejectsConflictingBinding(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "quality-probe-unbound.db"))
@@ -2845,6 +2910,7 @@ type failoverAdapter struct {
 	lastOperation          string
 	reasoningEffort        string
 	forwardedModels        []string
+	lastBody               []byte
 	resourceStatus         int
 	transportErrorIDs      map[uint64]error
 }
@@ -4532,6 +4598,7 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 	a.mu.Lock()
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.forwardedModels = append(a.forwardedModels, request.Model)
+	a.lastBody = append(a.lastBody[:0], request.Body...)
 	a.lastMethod = request.Method
 	a.lastPath = request.Path
 	a.lastPromptCacheKey = request.PromptCacheKey
@@ -4560,6 +4627,12 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 		header = a.failureHeader.Clone()
 	}
 	return &provider.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+func (a *failoverAdapter) LastBody() []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]byte(nil), a.lastBody...)
 }
 
 func (a *failoverAdapter) setResourceStatus(status int) {

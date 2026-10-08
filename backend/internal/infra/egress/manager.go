@@ -25,6 +25,7 @@ import (
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/infra/upstreamcapture"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"golang.org/x/sync/singleflight"
@@ -113,7 +114,11 @@ func (l *Lease) doRequest(request *http.Request, invalidateForbidden bool) (*htt
 	if l.Scope == domain.ScopeBuild && l.freshTunnel {
 		request.Close = true
 	}
+	capture := upstreamcapture.Start(request)
 	response, err := l.do(request)
+	if capture != nil {
+		response = capture.Finish(response, err)
+	}
 	recordPhysicalCall(request.Context(), response, err)
 	if invalidateForbidden && err == nil && response != nil && response.StatusCode == http.StatusForbidden {
 		l.InvalidateClearance()

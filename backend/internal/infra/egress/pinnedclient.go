@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/infra/upstreamcapture"
 	"github.com/chenyme/grok2api/backend/internal/pkg/tunnelproxy"
 	xproxy "golang.org/x/net/proxy"
 )
@@ -39,12 +40,21 @@ func (l *Lease) DoPinnedHTTPS(request *http.Request, serverName string) (*http.R
 	if err != nil || strings.TrimSuffix(strings.ToLower(hostURL.Hostname()), ".") != serverName {
 		return nil, errors.New("固定地址请求的 Host 与 TLS ServerName 不一致")
 	}
-	client, err := newPinnedHTTPSClient(l.ProxyURL, serverName, nil)
+	client, err := pinnedHTTPSClientFactory(l.ProxyURL, serverName, nil)
 	if err != nil {
 		return nil, err
 	}
-	return client.Do(request)
+	capture := upstreamcapture.Start(request)
+	response, requestErr := client.Do(request)
+	if capture != nil {
+		response = capture.Finish(response, requestErr)
+	}
+	return response, requestErr
 }
+
+// pinnedHTTPSClientFactory builds the one-shot client used by DoPinnedHTTPS.
+// Tests may replace it to observe the capture wrapper without dialing a public IP.
+var pinnedHTTPSClientFactory = newPinnedHTTPSClient
 
 func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*http.Client, error) {
 	serverName = strings.TrimSuffix(strings.TrimSpace(serverName), ".")

@@ -525,8 +525,6 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	case provider.VideoOperationExtend:
 		aspectRatio, resolution = "", ""
 	}
-	qualitySpec := newVideoQualitySpec(aspectRatio, imageURL, referenceURLs)
-
 	quotaMode := videoQuotaMode(route.Provider, s.providers.QuotaMode(route.Provider, route.UpstreamModel), job.Quality)
 	quotaRefreshGroup := s.providers.QuotaRefreshGroup(route.Provider, route.UpstreamModel)
 	attemptPolicy := s.videoAttemptPolicy()
@@ -640,13 +638,22 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		})
 		attemptTrace.ResultURL = result.URL
 		attemptTrace.ResultAssetID = result.AssetID
+		attemptTrace.ModeratedPresent = result.UpstreamMetadata.ModeratedPresent
+		attemptTrace.Moderated = result.UpstreamMetadata.Moderated
 		if err != nil {
 			s.logVideoUpstream("video_generation_attempt_failed", attemptTrace)
 		} else {
-			s.logVideoUpstream("video_generation_attempt_completed", attemptTrace)
+			if qualityErr := evaluateUpstreamVideoQuality(result.UpstreamMetadata); qualityErr != nil {
+				attemptTrace.QualityRejectionReason = qualityErr.reason
+				s.logVideoUpstream("video_quality_rejected", attemptTrace)
+				s.saveVideoQualityEvidence(attemptCtx, job, lease.Credential, adapter, result, attemptTrace, qualityErr)
+				err = qualityErr
+			} else {
+				s.logVideoUpstream("video_generation_attempt_completed", attemptTrace)
+			}
 		}
 		if err == nil && result.AssetID == "" && result.URL != "" {
-			result, err = s.persistRemoteVideo(attemptCtx, job.ID, adapter, lease.Credential, result, qualitySpec)
+			result, err = s.persistRemoteVideo(attemptCtx, job.ID, adapter, lease.Credential, result)
 		}
 		if err == nil {
 			break
@@ -973,7 +980,7 @@ func addVideoReferenceBytes(total *int64, referenceBytes int64) bool {
 
 // persistRemoteVideo 只重试已经生成的视频结果下载与本地归档，不重新调用生成接口，
 // 且所有尝试固定使用创建任务的同一凭据。
-func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter provider.VideoAdapter, credential account.Credential, result provider.VideoResult, qualitySpecs ...videoQualitySpec) (provider.VideoResult, error) {
+func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter provider.VideoAdapter, credential account.Credential, result provider.VideoResult) (provider.VideoResult, error) {
 	if s.mediaAssets == nil {
 		return result, provider.NewMediaPostProcessingError(provider.MediaPostProcessingStorage, errors.New("视频媒体存储未配置"))
 	}
@@ -981,11 +988,7 @@ func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter 
 	if !ok {
 		return result, provider.NewMediaPostProcessingError(provider.MediaPostProcessingDownload, errors.New("Provider 不支持视频内容下载"))
 	}
-	qualitySpec := videoQualitySpec{}
-	if len(qualitySpecs) > 0 {
-		qualitySpec = qualitySpecs[0]
-	}
-	ctx, trace := s.bindVideoDownloadTrace(ctx, jobID, credential, result, qualitySpec)
+	ctx, trace := s.bindVideoDownloadTrace(ctx, jobID, credential, result)
 	var lastErr error
 	for attempt := 0; attempt < videoOutputAttempts; attempt++ {
 		body, contentType, declaredBytes, downloadErr := downloader.DownloadVideo(ctx, credential, result.URL)
@@ -996,7 +999,7 @@ func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter 
 			lastErr = provider.NewMediaPostProcessingError(provider.MediaPostProcessingDownload, downloadErr)
 			s.logVideoUpstream("video_download_failed", trace)
 		} else {
-			asset, saveErr := s.saveVideoWithQuality(ctx, jobID, contentType, body, qualitySpec)
+			asset, saveErr := s.mediaAssets.SaveVideo(ctx, jobID, contentType, body)
 			_ = body.Close()
 			if saveErr == nil {
 				result.AssetID = asset.ID
@@ -1007,9 +1010,6 @@ func (s *Service) persistRemoteVideo(ctx context.Context, jobID string, adapter 
 				}
 				s.logVideoUpstream("video_download_saved", trace)
 				return result, nil
-			}
-			if isVideoQualityError(saveErr) {
-				return result, saveErr
 			}
 			lastErr = provider.NewMediaPostProcessingError(provider.MediaPostProcessingStorage, saveErr)
 			s.logVideoUpstream("video_download_failed", trace)

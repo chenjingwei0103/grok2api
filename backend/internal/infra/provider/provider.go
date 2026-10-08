@@ -561,11 +561,22 @@ type VideoRequest struct {
 	Progress func(int)
 }
 
+// VideoUpstreamMetadata is the small, non-secret video generation verdict
+// extracted from a Web streaming response. StreamObserved keeps providers
+// without this stream format out of the Web-only quality decision.
+type VideoUpstreamMetadata struct {
+	StreamObserved   bool
+	ModeratedPresent bool
+	Moderated        bool
+}
+
 type VideoResult struct {
 	URL         string
 	ContentType string
 	// A non-empty AssetID means the result is stored as a local media asset; content reads must use MediaObjectStorage.
 	AssetID string
+	// UpstreamMetadata is intentionally limited to the upstream moderation verdict.
+	UpstreamMetadata VideoUpstreamMetadata
 }
 
 type TTSOutputFormat struct {

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +38,12 @@ func TestClassifyQualityHold(t *testing.T) {
 		{name: "usage reasoning tokens alone withholds", sig: QualityStreamSignals{ReasoningTokens: 40, VisibleTokens: 80, Terminal: true}, want: QualityWithhold},
 		{name: "visible 32 no think withhold", sig: QualityStreamSignals{VisibleTokens: 32, Terminal: true}, want: QualityWithhold},
 		{name: "output 40 no think withhold", sig: QualityStreamSignals{OutputTokens: 40, Terminal: true}, want: QualityWithhold},
-		{name: "short visible output ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true}, want: QualityDeliver},
+		// 154 production trace audit_id=153808: the stream exposed 31 visible
+		// tokens but the final upstream usage reported 71 output and zero
+		// reasoning tokens. It must not receive the short-answer exemption.
+		{name: "server trace short visible zero reasoning high billed output withholds", sig: QualityStreamSignals{VisibleTokens: 31, OutputTokens: 71, ReasoningTokens: 0, Terminal: true}, want: QualityWithhold},
+		{name: "short visible no think with high billed output withholds", sig: QualityStreamSignals{VisibleTokens: 10, OutputTokens: 303, Terminal: true}, want: QualityWithhold},
+		{name: "short visible tool handoff ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true, ToolCallSeen: true}, want: QualityDeliver},
 		{name: "short no think delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
 		{name: "empty terminal waits for transport handling", sig: QualityStreamSignals{Terminal: true}, want: QualityWait},
 		{name: "midstream enough content withhold", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWithhold},
@@ -45,6 +51,7 @@ func TestClassifyQualityHold(t *testing.T) {
 		{name: "stub hold expiry with enough visible withholds", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, HoldExpired: true}, want: QualityWithhold},
 		{name: "stub-only hold expiry keeps waiting", sig: QualityStreamSignals{ReasoningStarted: true, HoldExpired: true}, want: QualityWait},
 		{name: "stub terminal enough withhold", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64, Terminal: true}, want: QualityWithhold},
+		{name: "encrypted thinking first visible waits for terminal", sig: QualityStreamSignals{HasThinking: true, EncryptedBytes: defaultMinEncryptedBytes, VisibleTokens: 10, FirstVisible: true, VisibleFlushMS: 0}, want: QualityWait},
 		{name: "wait for more", sig: QualityStreamSignals{VisibleTokens: 8}, want: QualityWait},
 		{name: "hold expired short delivers", sig: QualityStreamSignals{VisibleTokens: 8, HoldExpired: true}, want: QualityDeliver},
 		{name: "hold expired empty waits", sig: QualityStreamSignals{HoldExpired: true}, want: QualityWait},
@@ -57,6 +64,29 @@ func TestClassifyQualityHold(t *testing.T) {
 				t.Fatalf("ClassifyQualityHold() = %s, want %s", got, test.want)
 			}
 		})
+	}
+}
+
+func TestQualityTraceEnvelopeRecordsToolCallEvidence(t *testing.T) {
+	t.Parallel()
+	capture := newQualityStreamCapture(qualityProtocolResponses, qualityScanState{
+		protocol:       qualityProtocolResponses,
+		toolCallSeen:   true,
+		semanticOutput: true,
+		terminal:       true,
+		outputTokens:   80,
+	}, 0, false)
+	envelope := newQualityTraceEnvelope(qualityTraceAttemptInput{
+		RequestID: "req-quality-trace-tool-call",
+		Retry:     QualityRetryRuntime{MinOutputTokens: 32},
+		Capture:   capture,
+	}, accountdomain.Credential{ID: 7})
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"toolCallSeen":true`) {
+		t.Fatalf("quality trace omitted tool-call evidence: %s", encoded)
 	}
 }
 
@@ -991,7 +1021,7 @@ func TestPeekQualityStreamToolCallUsesVisibleTextForSpeed(t *testing.T) {
 	}
 }
 
-func TestPeekQualityStreamHighSpeedEncryptedThinkingWithholdsBeforeTerminal(t *testing.T) {
+func TestPeekQualityStreamEncryptedThinkingWaitsForTerminalBeforeWithholding(t *testing.T) {
 	t.Parallel()
 	reader, writer := io.Pipe()
 	done := make(chan qualityOpenPeekResult, 1)
@@ -1025,14 +1055,32 @@ func TestPeekQualityStreamHighSpeedEncryptedThinkingWithholdsBeforeTerminal(t *t
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
-		if result.verdict != QualityWithhold {
-			t.Fatalf("encrypted thinking early verdict = %s, want withhold", result.verdict)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("encrypted thinking stream was not classified before terminal")
+		t.Fatalf("encrypted thinking was withheld before terminal: %s", result.verdict)
+	case <-time.After(100 * time.Millisecond):
+		// The first visible delta has no meaningful flush duration yet. Keep
+		// holding until the stream's terminal event establishes the duration.
+	}
+	if _, err := io.WriteString(writer, sse(
+		`data: {"type":"response.completed","response":{"id":"resp_1"}}`,
+	)); err != nil {
+		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.replay != nil {
+			_ = result.replay.Close()
+		}
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.verdict != QualityWithhold {
+			t.Fatalf("encrypted thinking terminal verdict = %s, want withhold", result.verdict)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("encrypted thinking stream did not finish after terminal")
 	}
 }
 
@@ -2184,7 +2232,7 @@ func TestAttemptLoopQualityFailOpenFallbackAndTotalAttemptCap(t *testing.T) {
 func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	t.Parallel()
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})
-	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 8 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute || got.MinEncryptedBytes != defaultMinEncryptedBytes || got.EncryptedBytesPerReasoningToken != defaultEncryptedBytesPerReasoningToken {
+	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 32 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute || got.MinEncryptedBytes != defaultMinEncryptedBytes || got.EncryptedBytesPerReasoningToken != defaultEncryptedBytesPerReasoningToken {
 		t.Fatalf("defaults = %#v", got)
 	}
 }

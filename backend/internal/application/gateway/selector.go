@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -306,7 +307,9 @@ type Selector struct {
 	overlayProviderVersion map[account.Provider]uint64
 	candidateLoads         singleflight.Group
 	concurrencySnapshots   *resultcache.Cache[[32]byte, map[string]int]
-	tierOrders             interface {
+	// selectionTieBreak 供测试固定同分顺序。为空时每次计划使用随机值。
+	selectionTieBreak func() uint64
+	tierOrders        interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
 }
@@ -378,6 +381,13 @@ func (s *Selector) preferFreeBuildEnabled() bool {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
 	return s.preferFreeBuild
+}
+
+func (s *Selector) nextSelectionTieBreak() uint64 {
+	if s != nil && s.selectionTieBreak != nil {
+		return s.selectionTieBreak()
+	}
+	return rand.Uint64()
 }
 
 func (s *Selector) excludeBuildBotFlaggedEnabled() bool {

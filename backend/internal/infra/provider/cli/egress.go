@@ -10,6 +10,7 @@ import (
 
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/upstreamcapture"
 )
 
 type egressTransport struct {
@@ -37,7 +38,11 @@ func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, erro
 		}
 		if !configured {
 			idleRequest := t.withStreamIdleContext(request)
+			capture := upstreamcapture.Start(idleRequest)
 			response, requestErr := t.fallback.RoundTrip(idleRequest)
+			if capture != nil {
+				response = capture.Finish(response, requestErr)
+			}
 			infraegress.RecordDirectPhysicalCall(request.Context(), response, requestErr)
 			if requestErr != nil || response == nil || response.Body == nil {
 				return response, requestErr

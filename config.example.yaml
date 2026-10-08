@@ -166,7 +166,7 @@ qualityGuard:
     enabled: true
     maxAttempts: 6
     holdTimeout: 30s
-    minOutputTokens: 8
+    minOutputTokens: 32
     onExhausted: fail_closed # fail_open | fail_closed
     # First missing-thinking hit cools the account; a later hit after the
     # cooldown expires disables it.

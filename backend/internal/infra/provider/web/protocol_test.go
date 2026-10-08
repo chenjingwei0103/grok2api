@@ -1548,6 +1548,42 @@ func TestParseVideoStreamFixture(t *testing.T) {
 	}
 }
 
+func TestParseVideoStreamKeepsReadingAfterVideoURLForModerationMetadata(t *testing.T) {
+	fixture := `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":10}}}}` + "\n" +
+		`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":95,"videoUrl":"/videos/final.mp4"}}}}` + "\n" +
+		`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"moderated":false}}}}` + "\n" +
+		"data: [DONE]\n"
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+
+	result, _, _, err := parseVideoStream(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.URL != "https://assets.grok.com/videos/final.mp4" {
+		t.Fatalf("result URL = %q", result.URL)
+	}
+	metadata := result.UpstreamMetadata
+	if !metadata.StreamObserved || !metadata.ModeratedPresent || metadata.Moderated {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestParseVideoStreamCapturesModeratedTrue(t *testing.T) {
+	fixture := `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":95,"videoUrl":"/videos/final.mp4"}}}}` + "\n" +
+		`data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"moderated":true}}}}` + "\n" +
+		"data: [DONE]\n"
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+
+	result, _, _, err := parseVideoStream(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := result.UpstreamMetadata
+	if !metadata.StreamObserved || !metadata.ModeratedPresent || !metadata.Moderated {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
 func TestTextToVideoPayloadMatchesCapturedMediaGenInputShape(t *testing.T) {
 	payload := videoCreatePayload("雨后天晴！", "9:16", "480p", 6, "", nil)
 	if len(payload) != 8 || payload["modelName"] != "imagine-video-gen" ||

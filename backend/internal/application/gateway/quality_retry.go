@@ -22,7 +22,7 @@ const (
 	qualityRetryFailClosed                 = "fail_closed"
 	defaultQualityMaxAttempts              = 6
 	defaultQualityHoldTimeout              = 30 * time.Second
-	defaultQualityMinOutput                = int64(8)
+	defaultQualityMinOutput                = int64(32)
 	defaultQualityTraceInputBytes          = 4096
 	defaultQualityTraceOutputBytes         = 8192
 	defaultMinEncryptedBytes               = 256
@@ -112,6 +112,11 @@ type QualityStreamSignals struct {
 	Terminal              bool
 	HoldExpired           bool
 	OutputTokensPerSecond float64
+	// ToolCallSeen records any upstream tool-call event, including a mixed
+	// response that contains both a short status message and a tool call.
+	// It is intentionally distinct from ToolCallOnly so the terminal short-
+	// visible-output guard does not retry a normal handoff to the caller.
+	ToolCallSeen bool
 	// ToolCallOnly marks a terminal response whose semantic output is a tool
 	// call and which contains no user-visible text. Tool arguments are not
 	// ordinary answer text and must not trigger the output-speed guard.
@@ -211,7 +216,13 @@ func encryptedThinkingFloor(minBytes, bytesPerToken int, reasoningTokens int64) 
 }
 
 func qualityFastFlush(sig QualityStreamSignals, limitMS int64) bool {
-	return sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < limitMS
+	// The first visible delta is observed at the same instant
+	// firstVisibleAt is initialized, so a zero flush duration is not evidence
+	// of a burst while the stream is still open. At terminal, however, the
+	// whole response may have arrived in one buffered read; classify that
+	// complete dump instead of releasing it solely because its measured window
+	// is zero.
+	return sig.FirstVisible && (sig.VisibleFlushMS > 0 || sig.Terminal) && sig.VisibleFlushMS < limitMS
 }
 
 func qualityMeetsEncryptedFloor(sig QualityStreamSignals) bool {
@@ -300,6 +311,21 @@ func qualityIsCipherDrool(sig QualityStreamSignals, minOutput int64) bool {
 	return false
 }
 
+// qualityIsShortVisibleNoReasoningHighBilledOutput catches a terminal
+// response that exposed only a short visible fragment despite upstream
+// accounting a substantial output. A regular tool handoff may legitimately
+// have that shape, so it is explicitly excluded when a tool-call event was
+// observed in the stream.
+func qualityIsShortVisibleNoReasoningHighBilledOutput(sig QualityStreamSignals, minOutput int64) bool {
+	if minOutput <= 0 {
+		minOutput = defaultQualityMinOutput
+	}
+	if !sig.Terminal || sig.HasThinking || sig.ReasoningTokens > 0 || sig.ToolCallSeen || sig.VisibleTokens <= 0 {
+		return false
+	}
+	return sig.VisibleTokens < minOutput && sig.OutputTokens >= minOutput
+}
+
 // ClassifyQualityHold decides whether a held stream may be forwarded.
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
 	if minOutput <= 0 {
@@ -309,6 +335,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	// Degraded streams can report a large bill without emitting any reasoning
 	// event, so inspect the observed stream before allowing a terminal result.
 	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
+		return QualityWithhold
+	}
+	if qualityIsShortVisibleNoReasoningHighBilledOutput(sig, minOutput) {
 		return QualityWithhold
 	}
 	if sig.HasThinking {

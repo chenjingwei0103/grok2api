@@ -10,13 +10,14 @@ $pidPath = Join-Path $runtimeDir "grok2api.pid"
 $stdoutPath = Join-Path $runtimeDir "grok2api.stdout.log"
 $stderrPath = Join-Path $runtimeDir "grok2api.stderr.log"
 $qualityGuardDir = Join-Path $repoRoot "data\\quality-guard"
+$upstreamCaptureDir = Join-Path $qualityGuardDir "upstream-packets"
 $healthURL = "http://127.0.0.1:8000/healthz"
 
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
     throw "Missing local config: $configPath"
 }
 
-New-Item -ItemType Directory -Force -Path $runtimeDir, $qualityGuardDir | Out-Null
+New-Item -ItemType Directory -Force -Path $runtimeDir, $qualityGuardDir, $upstreamCaptureDir | Out-Null
 
 Write-Host "Building Grok2API..."
 Push-Location $backendDir
@@ -61,6 +62,9 @@ while (@(Get-NetTCPConnection -State Listen -LocalPort 8000 -ErrorAction Silentl
 
 Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 $env:GROK2API_QUALITY_GUARD_DIR = $qualityGuardDir
+$env:GROK2API_UPSTREAM_CAPTURE_DIR = $upstreamCaptureDir
+$env:GROK2API_SAVE_VIDEO_QUALITY_EVIDENCE = "false"
+Write-Host "Upstream packet capture directory: $upstreamCaptureDir"
 Write-Host "Starting Grok2API..."
 $process = Start-Process -FilePath $binaryPath -ArgumentList @("--config", $configPath, "--listen", "127.0.0.1:8000") -WorkingDirectory $repoRoot -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding ascii -NoNewline

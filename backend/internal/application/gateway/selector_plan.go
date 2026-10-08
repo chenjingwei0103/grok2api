@@ -22,6 +22,9 @@ type candidateScore struct {
 	inFlight          int
 	remaining         float64
 	lastSelected      time.Time
+	// tieBreak 只在其余路由条件完全相同时决定顺序。每个计划生成一次，
+	// 避免堆比较每次重抽，也避免新账号因为 ID 接近而被连续选中。
+	tieBreak uint64
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -105,6 +108,9 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	}
 	if !leftScore.lastSelected.Equal(rightScore.lastSelected) {
 		return leftScore.lastSelected.Before(rightScore.lastSelected)
+	}
+	if leftScore.tieBreak != rightScore.tieBreak {
+		return leftScore.tieBreak < rightScore.tieBreak
 	}
 	return left.ID < right.ID
 }
@@ -196,6 +202,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 			webCatalogSupport: candidate.Credential.Provider == account.ProviderWeb && len(tierOrder) > 0 && webTierInOrder(tierOrder, candidate.Credential.WebTier),
 			preferFreeBuild:   preferFreeBuild && candidate.IsKnownFreeBuild(),
 			inFlight:          inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
+			tieBreak: s.nextSelectionTieBreak(),
 		}
 		// 只有真实上游快照能够证明账号具备该模式额度。历史默认值和
 		// 本地预测值都属于未知能力，只保留为路由兜底。

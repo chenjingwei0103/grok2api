@@ -7,11 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +23,7 @@ import (
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	localmedia "github.com/chenyme/grok2api/backend/internal/infra/media"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
+	"github.com/chenyme/grok2api/backend/internal/infra/upstreamcapture"
 	"github.com/gin-gonic/gin"
 )
 
@@ -179,4 +183,84 @@ func TestAdminUploadCreatesHiddenTransientInput(t *testing.T) {
 	if values, total, err := service.AdminListImages(ctx, 1, 20, ""); err != nil || total != 0 || len(values) != 0 {
 		t.Fatalf("gallery values=%#v total=%d err=%v", values, total, err)
 	}
+}
+
+func TestIngestClientCapturesRemoteFetchWhenEnabled(t *testing.T) {
+	captureDirectory := t.TempDir()
+	t.Setenv(upstreamcapture.EnvironmentDirectory, captureDirectory)
+	payload := []byte("image-bytes")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "image/png")
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL + "/photo.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, inner := newIngestHTTPClient(&importTarget{fetchURL: parsed, hostHeader: parsed.Host, serverName: "images.example.test"})
+	inner.DialContext = (&net.Dialer{Timeout: 2 * time.Second}).DialContext
+	request, err := http.NewRequest(http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatalf("ingest body = %q", data)
+	}
+	bundle := singleIngestCaptureBundle(t, captureDirectory)
+	for _, name := range []string{"request.json", "request.body", "response.json", "response.body", "result.json"} {
+		if _, err := os.Stat(filepath.Join(bundle, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	if captured, err := os.ReadFile(filepath.Join(bundle, "response.body")); err != nil || !bytes.Equal(captured, payload) {
+		t.Fatalf("captured response = %q, err = %v", captured, err)
+	}
+
+	t.Setenv(upstreamcapture.EnvironmentDirectory, "")
+	disabledRequest, err := http.NewRequest(http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledResponse, err := client.Do(disabledRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(disabledResponse.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := disabledResponse.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(captureDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("capture entries after disable = %d, want 1", len(entries))
+	}
+}
+
+func singleIngestCaptureBundle(t *testing.T, captureDirectory string) string {
+	t.Helper()
+	entries, err := os.ReadDir(captureDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !entries[0].IsDir() {
+		t.Fatalf("capture entries = %#v, want one directory", entries)
+	}
+	return filepath.Join(captureDirectory, entries[0].Name())
 }

@@ -1155,6 +1155,31 @@ func TestSelectorPreferFreeBuildHotReloadAndSaturationFallback(t *testing.T) {
 	}
 }
 
+func TestCandidatePlanTieBreakOverridesAccountID(t *testing.T) {
+	limiter := &batchConcurrencyLimiter{values: map[string]int{}}
+	next := uint64(10)
+	selector := &Selector{
+		concurrency:    limiter,
+		lastSelectedAt: make(map[uint64]time.Time),
+		selectionTieBreak: func() uint64 {
+			next--
+			return next
+		},
+	}
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 1, Priority: 1}},
+		{Credential: account.Credential{ID: 2, Priority: 1}},
+	}
+	plan, err := selector.planCandidates(context.Background(), values, time.Now().UTC(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := plan.Next()
+	if !ok || first.Credential.ID != 2 {
+		t.Fatalf("first candidate = %#v, want the later account when its tie-break is smaller", first)
+	}
+}
+
 func TestCandidatePlanPreservesSelectorOrdering(t *testing.T) {
 	now := time.Now().UTC()
 	limiter := &batchConcurrencyLimiter{values: map[string]int{"account:2": 1}}

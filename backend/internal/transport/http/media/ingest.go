@@ -17,6 +17,7 @@ import (
 
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/infra/upstreamcapture"
 	"github.com/chenyme/grok2api/backend/internal/pkg/netguard"
 	"github.com/chenyme/grok2api/backend/internal/shared/response"
 	"github.com/gin-gonic/gin"
@@ -161,7 +162,7 @@ func newIngestHTTPClient(target *importTarget) (*http.Client, *http.Transport) {
 		ForceAttemptHTTP2:      true,
 	}
 	client := &http.Client{
-		Transport: transport,
+		Transport: upstreamcapture.WrapTransport(transport),
 		// 重定向必须回到 fetchRemoteImage 重新解析和固定目标，禁止 net/http 自动跟随。
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
