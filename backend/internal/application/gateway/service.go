@@ -1074,6 +1074,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if strippedSchemaToolCalls > 0 {
 		s.logger.Info("schema_index_tool_calls_stripped", "request_id", input.RequestID, "removed", strippedSchemaToolCalls)
 	}
+	upstreamBody, strippedTrailingQuestions := stripTrailingSingleQuestionMarks(upstreamBody)
+	if strippedTrailingQuestions > 0 {
+		s.logger.Info("trailing_questions_stripped", "request_id", input.RequestID, "removed", strippedTrailingQuestions)
+	}
 	upstreamBody, toolLoopEvidence := appendContinueForTrailingToolLoop(upstreamBody)
 	if toolLoopEvidence.Detected {
 		s.logger.Info(
@@ -1773,6 +1777,10 @@ attemptLoop:
 					} else {
 						_ = response.Body.Close()
 						lease.Release()
+					}
+					if qualityRetryAfterMissingReasoning {
+						upstreamBody = injectActionDirectiveOnRetry(upstreamBody)
+						s.logger.Info("quality_action_directive_injected_on_retry", "request_id", input.RequestID, "quality_attempt", qualityAccountAttempts)
 					}
 					lastErr = errQualityDegraded
 					lastFailure = &UpstreamFailure{
