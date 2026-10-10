@@ -45,6 +45,11 @@ func TestClassifyQualityHold(t *testing.T) {
 		{name: "short visible no think with high billed output withholds", sig: QualityStreamSignals{VisibleTokens: 10, OutputTokens: 303, Terminal: true}, want: QualityWithhold},
 		{name: "short visible tool handoff ignores inflated total", sig: QualityStreamSignals{VisibleTokens: 1, OutputTokens: 80, Terminal: true, ToolCallSeen: true}, want: QualityDeliver},
 		{name: "short no think delivers", sig: QualityStreamSignals{VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
+		// 154 production trace audit_id=155668: tools declared, verbal short response without reasoning or tool call must withhold
+		{name: "tool request verbal promise with zero reasoning and no tool call withholds", sig: QualityStreamSignals{RequestHasTools: true, VisibleTokens: 9, OutputTokens: 24, ReasoningTokens: 0, Terminal: true}, want: QualityWithhold},
+		{name: "tool request verbal promise hold expired with zero reasoning withholds", sig: QualityStreamSignals{RequestHasTools: true, VisibleTokens: 9, OutputTokens: 24, ReasoningTokens: 0, HoldExpired: true}, want: QualityWithhold},
+		{name: "tool request genuine tool call without visible text delivers", sig: QualityStreamSignals{RequestHasTools: true, ToolCallSeen: true, ToolCallOnly: true, OutputTokens: 24, Terminal: true}, want: QualityDeliver},
+		{name: "tool request thinking with verbal status delivers", sig: QualityStreamSignals{RequestHasTools: true, HasThinking: true, PlaintextThinking: true, VisibleTokens: 10, Terminal: true}, want: QualityDeliver},
 		{name: "empty terminal waits for transport handling", sig: QualityStreamSignals{Terminal: true}, want: QualityWait},
 		{name: "midstream enough content withhold", sig: QualityStreamSignals{VisibleTokens: 64}, want: QualityWithhold},
 		{name: "stub midstream waits even with enough visible", sig: QualityStreamSignals{ReasoningStarted: true, VisibleTokens: 64}, want: QualityWait},
@@ -2234,5 +2239,27 @@ func TestNormalizeQualityRetryDefaults(t *testing.T) {
 	got := normalizeQualityRetry(QualityRetryRuntime{Enabled: true})
 	if !got.Enabled || got.MaxAttempts != 6 || got.MinOutputTokens != 32 || got.OnExhausted != qualityRetryFailClosed || got.HoldTimeout != 30*time.Second || got.AccountCooldown != 12*time.Hour || got.IdleAccountCooldown != 15*time.Minute || got.MinEncryptedBytes != defaultMinEncryptedBytes || got.EncryptedBytesPerReasoningToken != defaultEncryptedBytesPerReasoningToken {
 		t.Fatalf("defaults = %#v", got)
+	}
+}
+
+func TestQualityRequestHasClientTools(t *testing.T) {
+	t.Parallel()
+	if qualityRequestHasClientTools(nil) {
+		t.Fatal("nil body should have no tools")
+	}
+	if qualityRequestHasClientTools([]byte("{}")) {
+		t.Fatal("empty object should have no tools")
+	}
+	if qualityRequestHasClientTools([]byte(`{"tools":[]}`)) {
+		t.Fatal("empty tools array should have no tools")
+	}
+	if !qualityRequestHasClientTools([]byte(`{"tools":[{"type":"function","name":"exec"}]}`)) {
+		t.Fatal("declared tools should return true")
+	}
+	if !qualityRequestHasClientTools([]byte(`{"functions":[{"name":"exec"}]}`)) {
+		t.Fatal("declared functions should return true")
+	}
+	if !qualityRequestHasClientTools([]byte(`{"input":[{"type":"additional_tools","tools":[{"type":"function","name":"read"}]}]}`)) {
+		t.Fatal("additional_tools should return true")
 	}
 }

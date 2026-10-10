@@ -77,6 +77,8 @@ type QualityRetryRuntime struct {
 	// reasoning retry. It prevents a later pure tool call from masking the
 	// same account-quality failure.
 	requireReasoningAfterRetry bool
+	// RequestHasTools indicates the incoming client request declared tools.
+	RequestHasTools bool
 }
 
 // QualityTraceRuntime controls private per-attempt diagnostics. It is kept
@@ -128,6 +130,8 @@ type QualityStreamSignals struct {
 	// RequireReasoningAfterRetry is set only after this request has already
 	// retried a response with no reasoning evidence.
 	RequireReasoningAfterRetry bool
+	// RequestHasTools indicates the client request declared tools.
+	RequestHasTools bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -363,6 +367,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	output := sig.VisibleTokens
 	if output <= 0 {
 		output = sig.OutputTokens
+	}
+	if sig.RequestHasTools && !sig.ToolCallSeen && (sig.Terminal || sig.HoldExpired) && output > 0 {
+		return QualityWithhold
 	}
 	enough := output >= minOutput
 	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
@@ -687,4 +694,32 @@ func (s *Service) recordQualityDegraded(ctx context.Context, base audit.Record, 
 	if err := s.audits.Create(writeCtx, record); err != nil {
 		s.logger.Error("quality_degraded_audit_failed", "event_id", record.EventID, "request_id", record.RequestID, "error", err)
 	}
+}
+
+func qualityRequestHasClientTools(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
+		return false
+	}
+	if tools, ok := payload["tools"].([]any); ok && len(tools) > 0 {
+		return true
+	}
+	if functions, ok := payload["functions"].([]any); ok && len(functions) > 0 {
+		return true
+	}
+	if items, ok := payload["input"].([]any); ok {
+		for _, rawItem := range items {
+			item, ok := rawItem.(map[string]any)
+			if !ok || jsonNodeString(item["type"]) != "additional_tools" {
+				continue
+			}
+			if tools, ok := item["tools"].([]any); ok && len(tools) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -33,6 +33,7 @@ type qualityScanState struct {
 	toolCallSeen                    bool
 	schemaIndexToolCall             bool
 	requireReasoningAfterRetry      bool
+	requestHasTools                 bool
 	reasoningTokens                 int64
 	outputTokens                    int64
 	encryptedBytes                  int
@@ -205,6 +206,7 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 		ToolCallOnly:               s.toolCallSeen && visible <= 0,
 		SchemaIndexToolCall:        s.schemaIndexToolCall,
 		RequireReasoningAfterRetry: s.requireReasoningAfterRetry,
+		RequestHasTools:            s.requestHasTools,
 	}
 }
 
@@ -653,6 +655,7 @@ func peekQualityStreamCaptured(ctx context.Context, body io.ReadCloser, protocol
 		minEncryptedBytes:               cfg.MinEncryptedBytes,
 		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
 		requireReasoningAfterRetry:      cfg.requireReasoningAfterRetry,
+		requestHasTools:                 cfg.RequestHasTools,
 		startedAt:                       time.Now(),
 	}
 	if cfg.Trace.Enabled {

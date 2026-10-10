@@ -1670,6 +1670,7 @@ attemptLoop:
 			if qualityHoldEnabled {
 				attemptHoldCfg := holdCfg
 				attemptHoldCfg.requireReasoningAfterRetry = qualityRetryAfterMissingReasoning
+				attemptHoldCfg.RequestHasTools = qualityRequestHasClientTools(input.Body)
 				peek, peekErr := peekQualityStreamCaptured(ctx, response.Body, qualityProtocolForOperation(operation), attemptHoldCfg)
 				if peekErr != nil {
 					if holdCfg.Trace.Enabled {

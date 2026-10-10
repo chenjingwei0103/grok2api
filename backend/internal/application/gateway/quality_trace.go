@@ -412,6 +412,7 @@ type qualityTraceEnvelope struct {
 			ToolCallSeen        bool    `json:"toolCallSeen"`
 			ToolCallOnly        bool    `json:"toolCallOnly"`
 			SchemaIndexToolCall bool    `json:"schemaIndexToolCall"`
+			RequestHasTools     bool    `json:"requestHasTools"`
 		} `json:"signals"`
 	} `json:"quality"`
 	Timing struct {
@@ -487,6 +488,7 @@ func newQualityTraceEnvelope(input qualityTraceAttemptInput, credential accountd
 	result.Quality.Signals.ToolCallSeen = signals.ToolCallSeen
 	result.Quality.Signals.ToolCallOnly = signals.ToolCallOnly
 	result.Quality.Signals.SchemaIndexToolCall = signals.SchemaIndexToolCall
+	result.Quality.Signals.RequestHasTools = signals.RequestHasTools
 	if !state.startedAt.IsZero() && !state.completedAt.IsZero() && signals.OutputTokens > 0 {
 		durationMS := state.completedAt.Sub(state.startedAt).Milliseconds()
 		if durationMS > 0 {
