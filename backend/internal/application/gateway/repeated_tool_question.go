@@ -100,7 +100,7 @@ func detectTrailingToolLoop(items []json.RawMessage) ToolLoopEvidence {
 				continue
 			}
 			delete(pending, callID)
-			output := canonicalToolJSON(item["output"])
+			output := normalizeToolOutputForLoopDetection(canonicalToolJSON(item["output"]))
 			fingerprint := call.name + "\x00" + call.arguments + "\x00" + output
 			if fingerprint == lastFingerprint {
 				consecutive++
@@ -186,6 +186,35 @@ func rawString(raw json.RawMessage) string {
 		return ""
 	}
 	return value
+}
+
+// normalizeToolOutputForLoopDetection strips dynamic runner/PTY metadata headers
+// (such as Codex CLI Chunk ID, Wall time, Original token count, session ID)
+// so repeated commands producing identical semantic errors can be accurately detected.
+func normalizeToolOutputForLoopDetection(output string) string {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, rawLine := range lines {
+		line := strings.TrimRight(strings.TrimSpace(rawLine), "\r")
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "chunk id:") ||
+			strings.HasPrefix(lower, "wall time:") ||
+			strings.HasPrefix(lower, "original token count:") ||
+			strings.HasPrefix(lower, "total output lines:") ||
+			strings.HasPrefix(lower, "warning: truncated output") ||
+			lower == "output:" {
+			continue
+		}
+		if strings.HasPrefix(lower, "process running with session id") {
+			line = "process running with session id"
+		}
+		kept = append(kept, line)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
 func canonicalToolJSON(raw json.RawMessage) string {

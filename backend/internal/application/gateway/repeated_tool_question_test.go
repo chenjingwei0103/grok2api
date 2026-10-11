@@ -105,3 +105,17 @@ func assertTrailingContinue(t *testing.T, body []byte) {
 		t.Fatalf("trailing input = %#v, want user continue", last)
 	}
 }
+
+func TestAppendContinueForTrailingToolLoopIgnoresDynamicRunnerHeaders(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"edit file"},{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"python patch.py\"}"},{"type":"function_call_output","call_id":"call_1","output":"Chunk ID: 1a2b3c\nWall time: 0.1413 seconds\nProcess exited with code 1\nOriginal token count: 41\nOutput:\nSyntaxError: unterminated string" },{"type":"function_call","call_id":"call_2","name":"exec_command","arguments":"{\"cmd\":\"python patch.py\"}"},{"type":"function_call_output","call_id":"call_2","output":"Chunk ID: 4d5e6f\nWall time: 0.1629 seconds\nProcess exited with code 1\nOriginal token count: 41\nOutput:\nSyntaxError: unterminated string" },{"type":"function_call","call_id":"call_3","name":"exec_command","arguments":"{\"cmd\":\"python patch.py\"}"},{"type":"function_call_output","call_id":"call_3","output":"Chunk ID: 7a8b9c\nWall time: 0.1758 seconds\nProcess exited with code 1\nOriginal token count: 41\nOutput:\nSyntaxError: unterminated string" }]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if !evidence.Detected {
+		t.Fatal("three identical calls with varying Chunk ID/Wall time headers must still be detected as a loop")
+	}
+	if evidence.ConsecutiveCount != 3 {
+		t.Fatalf("consecutive count = %d, want 3", evidence.ConsecutiveCount)
+	}
+	assertTrailingContinue(t, got)
+}
