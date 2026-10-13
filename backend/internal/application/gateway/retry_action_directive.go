@@ -19,41 +19,92 @@ func injectActionDirectiveOnRetry(body []byte) []byte {
 	if err := json.Unmarshal(body, &root); err != nil {
 		return body
 	}
-	rawInput, ok := root["input"]
-	if !ok {
-		return body
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(rawInput, &items); err != nil {
-		return body
-	}
-	directivePrompt := retryActionDirectivePrompt
-	if hasTrailingToolOutput(items) {
-		directivePrompt = retrySummaryDirectivePrompt
-	}
 
-	// Do not append if already present
-	if len(items) > 0 {
-		last := decodeRawObject(items[len(items)-1])
-		if last != nil {
-			txt := strings.TrimSpace(extractUserTextContent(last))
-			if txt == retryActionDirectivePrompt || txt == retrySummaryDirectivePrompt {
-				return body
+	// 1. Check Responses API input
+	if rawInput, ok := root["input"]; ok {
+		var items []json.RawMessage
+		if err := json.Unmarshal(rawInput, &items); err == nil {
+			directivePrompt := retryActionDirectivePrompt
+			if hasTrailingToolOutput(items) {
+				directivePrompt = retrySummaryDirectivePrompt
+			}
+
+			// Do not append if already present
+			if len(items) > 0 {
+				last := decodeRawObject(items[len(items)-1])
+				if last != nil {
+					txt := strings.TrimSpace(extractUserTextContent(last))
+					if txt == retryActionDirectivePrompt || txt == retrySummaryDirectivePrompt {
+						return body
+					}
+				}
+			}
+			promptJSON, _ := json.Marshal(directivePrompt)
+			items = append(items, json.RawMessage(`{"type":"message","role":"user","content":`+string(promptJSON)+`}`))
+			encodedInput, err := marshalRawJSON(items)
+			if err == nil {
+				root["input"] = encodedInput
+				if encoded, err := marshalRawJSON(root); err == nil {
+					return encoded
+				}
 			}
 		}
 	}
-	promptJSON, _ := json.Marshal(directivePrompt)
-	items = append(items, json.RawMessage(`{"type":"message","role":"user","content":`+string(promptJSON)+`}`))
-	encodedInput, err := marshalRawJSON(items)
-	if err != nil {
-		return body
+
+	// 2. Check Chat API messages
+	if rawMessages, ok := root["messages"]; ok {
+		var msgs []json.RawMessage
+		if err := json.Unmarshal(rawMessages, &msgs); err == nil {
+			directivePrompt := retryActionDirectivePrompt
+			if hasTrailingChatMessageToolOutput(msgs) {
+				directivePrompt = retrySummaryDirectivePrompt
+			}
+
+			// Do not append if already present
+			if len(msgs) > 0 {
+				last := decodeRawObject(msgs[len(msgs)-1])
+				if last != nil {
+					txt := strings.TrimSpace(rawString(last["content"]))
+					if txt == retryActionDirectivePrompt || txt == retrySummaryDirectivePrompt {
+						return body
+					}
+				}
+			}
+			promptJSON, _ := json.Marshal(directivePrompt)
+			msgs = append(msgs, json.RawMessage(`{"role":"user","content":`+string(promptJSON)+`}`))
+			encodedMsgs, err := marshalRawJSON(msgs)
+			if err == nil {
+				root["messages"] = encodedMsgs
+				if encoded, err := marshalRawJSON(root); err == nil {
+					return encoded
+				}
+			}
+		}
 	}
-	root["input"] = encodedInput
-	encoded, err := marshalRawJSON(root)
-	if err != nil {
-		return body
+
+	return body
+}
+
+// hasTrailingChatMessageToolOutput reports whether the last meaningful item in chat messages
+// is a tool or function output.
+func hasTrailingChatMessageToolOutput(msgs []json.RawMessage) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		item := decodeRawObject(msgs[i])
+		if item == nil {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(rawString(item["role"])))
+		if role == "tool" || role == "function" {
+			return true
+		}
+		if _, hasToolCallID := item["tool_call_id"]; hasToolCallID {
+			return true
+		}
+		if role == "assistant" || role == "user" || role == "system" {
+			break
+		}
 	}
-	return encoded
+	return false
 }
 
 // hasTrailingToolOutput reports whether the last meaningful item in the input

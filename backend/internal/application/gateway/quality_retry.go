@@ -700,26 +700,60 @@ func qualityRequestHasClientTools(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
-	var payload map[string]any
+	var payload map[string]json.RawMessage
 	if json.Unmarshal(body, &payload) != nil || payload == nil {
 		return false
 	}
-	if tools, ok := payload["tools"].([]any); ok && len(tools) > 0 {
-		return true
+	hasTools := false
+	if rawTools, ok := payload["tools"]; ok {
+		var list []any
+		if json.Unmarshal(rawTools, &list) == nil && len(list) > 0 {
+			hasTools = true
+		}
 	}
-	if functions, ok := payload["functions"].([]any); ok && len(functions) > 0 {
-		return true
-	}
-	if items, ok := payload["input"].([]any); ok {
-		for _, rawItem := range items {
-			item, ok := rawItem.(map[string]any)
-			if !ok || jsonNodeString(item["type"]) != "additional_tools" {
-				continue
-			}
-			if tools, ok := item["tools"].([]any); ok && len(tools) > 0 {
-				return true
+	if !hasTools {
+		if rawFunctions, ok := payload["functions"]; ok {
+			var list []any
+			if json.Unmarshal(rawFunctions, &list) == nil && len(list) > 0 {
+				hasTools = true
 			}
 		}
 	}
-	return false
+	if !hasTools {
+		if rawInput, ok := payload["input"]; ok {
+			var items []json.RawMessage
+			if json.Unmarshal(rawInput, &items) == nil {
+				for _, rawItem := range items {
+					item := decodeRawObject(rawItem)
+					if item != nil && rawString(item["type"]) == "additional_tools" {
+						var toolList []any
+						if json.Unmarshal(item["tools"], &toolList) == nil && len(toolList) > 0 {
+							hasTools = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	if !hasTools {
+		return false
+	}
+
+	// If the request declared tools but the context ends with tool output,
+	// the model is supposed to report summary/findings, not call another tool.
+	if rawInput, ok := payload["input"]; ok {
+		var items []json.RawMessage
+		if json.Unmarshal(rawInput, &items) == nil && hasTrailingToolOutput(items) {
+			return false
+		}
+	}
+	if rawMessages, ok := payload["messages"]; ok {
+		var msgs []json.RawMessage
+		if json.Unmarshal(rawMessages, &msgs) == nil && hasTrailingChatMessageToolOutput(msgs) {
+			return false
+		}
+	}
+
+	return true
 }

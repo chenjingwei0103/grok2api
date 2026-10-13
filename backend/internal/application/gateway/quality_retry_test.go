@@ -2262,4 +2262,12 @@ func TestQualityRequestHasClientTools(t *testing.T) {
 	if !qualityRequestHasClientTools([]byte(`{"input":[{"type":"additional_tools","tools":[{"type":"function","name":"read"}]}]}`)) {
 		t.Fatal("additional_tools should return true")
 	}
+	// With trailing tool output in Responses API input, summary phase should not treat RequestHasTools as true
+	if qualityRequestHasClientTools([]byte(`{"tools":[{"type":"function","name":"exec"}],"input":[{"type":"function_call","name":"exec"},{"type":"function_call_output","output":"ok"}]}`)) {
+		t.Fatal("trailing function_call_output should return false")
+	}
+	// With trailing tool output in Chat API messages, summary phase should not treat RequestHasTools as true
+	if qualityRequestHasClientTools([]byte(`{"tools":[{"type":"function","name":"exec"}],"messages":[{"role":"tool","content":"ok"}]}`)) {
+		t.Fatal("trailing tool message should return false")
+	}
 }

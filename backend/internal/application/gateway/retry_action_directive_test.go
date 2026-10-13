@@ -53,4 +53,38 @@ func TestInjectActionDirectiveOnRetry(t *testing.T) {
 	if string(reInjectedTool) != string(injectedTool) {
 		t.Fatalf("expected no-op on already injected summary directive, got changed body")
 	}
+
+	// Case 5: Chat API messages with trailing tool message -> injects summary directive
+	bodyChatTool := []byte(`{"model":"grok-4.7","messages":[{"role":"user","content":"check disk"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"df -h\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"Filesystem 50G"}]}`)
+	injectedChatTool := injectActionDirectiveOnRetry(bodyChatTool)
+	var rootChatTool struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(injectedChatTool, &rootChatTool); err != nil {
+		t.Fatalf("failed to unmarshal chat: %v", err)
+	}
+	if len(rootChatTool.Messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d", len(rootChatTool.Messages))
+	}
+	lastContentChat := rootChatTool.Messages[3]["content"].(string)
+	if lastContentChat != retrySummaryDirectivePrompt {
+		t.Fatalf("expected chat summary directive %q, got %q", retrySummaryDirectivePrompt, lastContentChat)
+	}
+
+	// Case 6: Chat API messages with trailing user message -> injects action directive
+	bodyChatUser := []byte(`{"model":"grok-4.7","messages":[{"role":"user","content":"please fix it"}]}`)
+	injectedChatUser := injectActionDirectiveOnRetry(bodyChatUser)
+	var rootChatUser struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(injectedChatUser, &rootChatUser); err != nil {
+		t.Fatalf("failed to unmarshal chat user: %v", err)
+	}
+	if len(rootChatUser.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(rootChatUser.Messages))
+	}
+	lastContentChatUser := rootChatUser.Messages[1]["content"].(string)
+	if lastContentChatUser != retryActionDirectivePrompt {
+		t.Fatalf("expected chat action directive %q, got %q", retryActionDirectivePrompt, lastContentChatUser)
+	}
 }
