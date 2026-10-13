@@ -1062,6 +1062,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
 	qualityRetryAfterMissingReasoning := false
+	qualityMissingReasoningStreak := 0
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	selection := preselectedSession
@@ -1720,6 +1721,15 @@ attemptLoop:
 					hasNextAccount = false
 				}
 				commit := CommitQualityHold(peek.verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+				if peek.verdict == QualityWithhold && qualityRetryNeedsReasoningAfterRetry(peek.capture.signals(), peek.verdict) {
+					qualityMissingReasoningStreak++
+				} else {
+					qualityMissingReasoningStreak = 0
+				}
+				// No-tool requests that hit missing_reasoning 3 times in a row are context-driven, not account-driven: stop switching accounts and deliver the last response.
+				if commit.Action == QualityActionRetry && !peek.capture.signals().RequestHasTools && qualityMissingReasoningStreak >= 3 {
+					commit = QualityCommit{Action: QualityActionDeliverLast, Audit: false, KeepBody: true}
+				}
 				if commit.Action == QualityActionRetry && qualityRetryNeedsReasoningAfterRetry(peek.capture.signals(), peek.verdict) {
 					qualityRetryAfterMissingReasoning = true
 				}
@@ -1779,7 +1789,7 @@ attemptLoop:
 						_ = response.Body.Close()
 						lease.Release()
 					}
-					if qualityRetryAfterMissingReasoning {
+					if qualityRetryAfterMissingReasoning && peek.capture.signals().RequestHasTools {
 						upstreamBody = injectActionDirectiveOnRetry(upstreamBody)
 						s.logger.Info("quality_action_directive_injected_on_retry", "request_id", input.RequestID, "quality_attempt", qualityAccountAttempts)
 					}
