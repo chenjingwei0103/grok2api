@@ -8,7 +8,11 @@ import (
 // Distinctive line from grok-build full_replace_summary_prompt.txt and the
 // Grok TUI compaction request. Codex remote-v2 uses compaction_trigger
 // instead; the TUI appends this prompt as a normal last user item.
-const clientCompactionPromptMarker = "it is a system-generated compaction prompt, not a real user message"
+const (
+	clientCompactionPromptMarker    = "it is a system-generated compaction prompt, not a real user message"
+	codexCompactionCheckpointMarker = "CONTEXT CHECKPOINT COMPACTION"
+	codexCompactionHandoffMarker    = "Create a handoff summary for another LLM"
+)
 
 type responsesCompactionKind uint8
 
@@ -29,6 +33,10 @@ func isResponsesCompactionRequest(body []byte) bool {
 
 func classifyResponsesCompactionRequest(body []byte) responsesCompactionKind {
 	var payload struct {
+		ClientMetadata struct {
+			RequestKind       string `json:"request_kind"`
+			CodexTurnMetadata string `json:"x-codex-turn-metadata"`
+		} `json:"client_metadata"`
 		Input    []json.RawMessage `json:"input"`
 		Messages []json.RawMessage `json:"messages"`
 	}
@@ -37,6 +45,10 @@ func classifyResponsesCompactionRequest(body []byte) responsesCompactionKind {
 	}
 	if hasCompactionTrigger(payload.Input) {
 		return responsesCompactionTrigger
+	}
+	if strings.EqualFold(strings.TrimSpace(payload.ClientMetadata.RequestKind), "compaction") ||
+		strings.Contains(payload.ClientMetadata.CodexTurnMetadata, `"request_kind":"compaction"`) {
+		return responsesCompactionTUI
 	}
 	if lastItemLooksLikeCompactionPrompt(payload.Input) || lastItemLooksLikeCompactionPrompt(payload.Messages) {
 		return responsesCompactionTUI
@@ -74,7 +86,9 @@ func lastItemLooksLikeCompactionPrompt(items []json.RawMessage) bool {
 }
 
 func looksLikeCompactionPrompt(text string) bool {
-	return strings.Contains(text, clientCompactionPromptMarker)
+	return strings.Contains(text, clientCompactionPromptMarker) ||
+		strings.Contains(text, codexCompactionCheckpointMarker) ||
+		strings.Contains(text, codexCompactionHandoffMarker)
 }
 
 func extractContentText(raw json.RawMessage) string {

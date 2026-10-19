@@ -19,6 +19,8 @@ func TestIsResponsesCompactionRequest(t *testing.T) {
 		{name: "assistant prompt", body: `{"input":[{"role":"assistant","content":"` + tuiCompactionPrompt + `"}]}`, want: responsesCompactionNone},
 		{name: "system prompt", body: `{"messages":[{"role":"system","content":"` + tuiCompactionPrompt + `"}]}`, want: responsesCompactionNone},
 		{name: "missing role", body: `{"input":[{"content":"` + tuiCompactionPrompt + `"}]}`, want: responsesCompactionNone},
+		{name: "codex compaction checkpoint prompt", body: `{"input":[{"role":"user","content":"You are performing a CONTEXT CHECKPOINT COMPACTION."}]}`, want: responsesCompactionTUI},
+		{name: "codex compaction turn metadata", body: `{"client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"compaction\"}"},"input":[{"role":"user","content":"hello"}]}`, want: responsesCompactionTUI},
 		{name: "normal responses", body: `{"input":[{"role":"user","content":"continue"}]}`, want: responsesCompactionNone},
 		{name: "string input", body: `{"input":"continue"}`, want: responsesCompactionNone},
 		{name: "invalid json", body: `{`, want: responsesCompactionNone},
