@@ -1,4 +1,4 @@
-﻿package gateway
+package gateway
 
 import (
 	"encoding/json"
@@ -118,4 +118,31 @@ func TestAppendContinueForTrailingToolLoopIgnoresDynamicRunnerHeaders(t *testing
 		t.Fatalf("consecutive count = %d, want 3", evidence.ConsecutiveCount)
 	}
 	assertTrailingContinue(t, got)
+}
+
+func TestAppendContinueForTrailingToolLoopDetectsAlternatingCycleWithAssistantMessages(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect the binary"},{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"inspect timeout\"}"},{"type":"function_call_output","call_id":"call_1","output":"timeout result"},{"type":"function_call","call_id":"call_2","name":"exec_command","arguments":"{\"cmd\":\"inspect q6o\"}"},{"type":"message","role":"assistant","content":"I will inspect it again."},{"type":"function_call_output","call_id":"call_2","output":"q6o result"},{"type":"function_call","call_id":"call_3","name":"exec_command","arguments":"{\"cmd\":\"inspect timeout\"}"},{"type":"function_call_output","call_id":"call_3","output":"timeout result"},{"type":"function_call","call_id":"call_4","name":"exec_command","arguments":"{\"cmd\":\"inspect q6o\"}"},{"type":"message","role":"assistant","content":"I will inspect it again."},{"type":"function_call_output","call_id":"call_4","output":"q6o result"},{"type":"function_call","call_id":"call_5","name":"exec_command","arguments":"{\"cmd\":\"inspect timeout\"}"},{"type":"function_call_output","call_id":"call_5","output":"timeout result"},{"type":"function_call","call_id":"call_6","name":"exec_command","arguments":"{\"cmd\":\"inspect q6o\"}"},{"type":"message","role":"assistant","content":"I will inspect it again."},{"type":"function_call_output","call_id":"call_6","output":"q6o result"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if !evidence.Detected {
+		t.Fatal("three identical A-B tool cycles separated by assistant messages must be detected")
+	}
+	if evidence.ConsecutiveCount != 6 {
+		t.Fatalf("consecutive count = %d, want 6 completed calls", evidence.ConsecutiveCount)
+	}
+	assertTrailingContinue(t, got)
+}
+
+func TestAppendContinueForTrailingToolLoopDoesNotTreatDifferentCallsAsCycle(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"inspect"},{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"pwd\"}"},{"type":"function_call_output","call_id":"call_1","output":"E:/grok2api2"},{"type":"message","role":"assistant","content":"next"},{"type":"function_call","call_id":"call_2","name":"bash","arguments":"{\"cmd\":\"git status\"}"},{"type":"function_call_output","call_id":"call_2","output":" M service.go"},{"type":"function_call","call_id":"call_3","name":"bash","arguments":"{\"cmd\":\"git diff\"}"},{"type":"function_call_output","call_id":"call_3","output":"diff --git a/service.go b/service.go"}]}`)
+
+	got, evidence := appendContinueForTrailingToolLoop(body)
+	if evidence.Detected {
+		t.Fatalf("three distinct calls must not be detected as a loop: %#v", evidence)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("body changed without a loop: %s", got)
+	}
 }

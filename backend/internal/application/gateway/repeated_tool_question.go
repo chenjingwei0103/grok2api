@@ -1,4 +1,4 @@
-﻿package gateway
+package gateway
 
 import (
 	"bytes"
@@ -61,8 +61,7 @@ func appendContinueForTrailingToolLoop(body []byte) ([]byte, ToolLoopEvidence) {
 func detectTrailingToolLoop(items []json.RawMessage) ToolLoopEvidence {
 	var evidence ToolLoopEvidence
 	pending := make(map[string]repeatedToolCallRecord)
-	lastFingerprint := ""
-	consecutive := 0
+	completed := make([]repeatedToolCallRecord, 0, len(items))
 	for _, raw := range items {
 		item := decodeRawObject(raw)
 		if item == nil {
@@ -70,8 +69,7 @@ func detectTrailingToolLoop(items []json.RawMessage) ToolLoopEvidence {
 		}
 		if isMeaningfulUserInput(item) {
 			pending = make(map[string]repeatedToolCallRecord)
-			lastFingerprint = ""
-			consecutive = 0
+			completed = completed[:0]
 			evidence = ToolLoopEvidence{}
 			continue
 		}
@@ -83,8 +81,7 @@ func detectTrailingToolLoop(items []json.RawMessage) ToolLoopEvidence {
 			arguments := canonicalToolJSON(toolCallInput(item, typeName))
 			if callID == "" || name == "" || arguments == "" {
 				pending = make(map[string]repeatedToolCallRecord)
-				lastFingerprint = ""
-				consecutive = 0
+				completed = completed[:0]
 				evidence = ToolLoopEvidence{}
 				continue
 			}
@@ -94,45 +91,80 @@ func detectTrailingToolLoop(items []json.RawMessage) ToolLoopEvidence {
 			call, ok := pending[callID]
 			if !ok {
 				pending = make(map[string]repeatedToolCallRecord)
-				lastFingerprint = ""
-				consecutive = 0
+				completed = completed[:0]
 				evidence = ToolLoopEvidence{}
 				continue
 			}
 			delete(pending, callID)
 			output := normalizeToolOutputForLoopDetection(canonicalToolJSON(item["output"]))
-			fingerprint := call.name + "\x00" + call.arguments + "\x00" + output
-			if fingerprint == lastFingerprint {
-				consecutive++
-			} else {
-				consecutive = 1
-				evidence = ToolLoopEvidence{}
-			}
-			lastFingerprint = fingerprint
-			if consecutive >= repeatedToolContinueThreshold {
-				evidence = ToolLoopEvidence{
-					Detected:         true,
-					ToolName:         call.name,
-					ArgumentsHash:    shortToolLoopHash(call.arguments),
-					OutputHash:       shortToolLoopHash(output),
-					ConsecutiveCount: consecutive,
-				}
-			}
+			completed = append(completed, repeatedToolCallRecord{
+				name:        call.name,
+				arguments:   call.arguments,
+				output:      output,
+				fingerprint: call.name + "\x00" + call.arguments + "\x00" + output,
+			})
 		case "reasoning":
 			// Reasoning items can be interleaved with a tool call/output pair
 			// in Responses history; they do not make the tool tail non-contiguous.
 			continue
+		case "message":
+			// Codex can emit a short assistant message between identical tool
+			// cycles. It must not hide an A-B-A-B loop from the breaker.
+			if strings.EqualFold(strings.TrimSpace(rawString(item["role"])), "assistant") {
+				continue
+			}
+			pending = make(map[string]repeatedToolCallRecord)
+			completed = completed[:0]
+			evidence = ToolLoopEvidence{}
 		default:
 			pending = make(map[string]repeatedToolCallRecord)
-			lastFingerprint = ""
-			consecutive = 0
+			completed = completed[:0]
 			evidence = ToolLoopEvidence{}
 		}
 	}
 	if len(pending) > 0 {
 		return ToolLoopEvidence{}
 	}
+	if cycle := trailingRepeatedToolCycle(completed); cycle > 0 {
+		last := completed[len(completed)-1]
+		evidence = ToolLoopEvidence{
+			Detected:         true,
+			ToolName:         last.name,
+			ArgumentsHash:    shortToolLoopHash(last.arguments),
+			OutputHash:       shortToolLoopHash(last.output),
+			ConsecutiveCount: cycle * repeatedToolContinueThreshold,
+		}
+	}
 	return evidence
+}
+
+// trailingRepeatedToolCycle returns the number of completed calls in the
+// repeated suffix when the tail contains at least three identical cycles.
+// Tool turns may legitimately repeat one command or alternate a small set of
+// commands, so periods up to four are checked instead of requiring one
+// identical fingerprint back-to-back.
+func trailingRepeatedToolCycle(completed []repeatedToolCallRecord) int {
+	const maxCycleLength = 4
+	for cycle := 1; cycle <= maxCycleLength; cycle++ {
+		if len(completed) < cycle*repeatedToolContinueThreshold {
+			continue
+		}
+		matches := true
+		lastStart := len(completed) - cycle
+		for offset := 1; offset < repeatedToolContinueThreshold && matches; offset++ {
+			start := lastStart - offset*cycle
+			for i := 0; i < cycle; i++ {
+				if completed[start+i].fingerprint != completed[lastStart+i].fingerprint {
+					matches = false
+					break
+				}
+			}
+		}
+		if matches {
+			return cycle
+		}
+	}
+	return 0
 }
 
 func shortToolLoopHash(value string) string {
@@ -141,8 +173,10 @@ func shortToolLoopHash(value string) string {
 }
 
 type repeatedToolCallRecord struct {
-	name      string
-	arguments string
+	name        string
+	arguments   string
+	output      string
+	fingerprint string
 }
 
 func isMeaningfulUserInput(item map[string]json.RawMessage) bool {
