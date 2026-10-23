@@ -203,6 +203,9 @@ qualityGuard:
   nodeIDs: [2, 9]
   minimumHealthyNodes: 1
   activeInterval: 45m
+  requestRetry:
+    enabled: true
+    autoDisable: true
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
@@ -304,13 +307,13 @@ func TestBuildResponseHeaderTimeoutIsRuntimeOnly(t *testing.T) {
 
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "1.0.4" {
+	if RecommendedBuildClientVersion != "1.0.60" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/1.0.4 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/1.0.60 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {

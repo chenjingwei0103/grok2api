@@ -37,24 +37,26 @@ type ProviderBuildRecommendation struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL                 string
-	StatsigMode             string
-	StatsigManualValue      string
-	StatsigManualConfigured bool
-	StatsigSignerURL        string
-	ClearanceMode           string
-	FlareSolverrURL         string
-	ClearanceTimeout        string
-	ClearanceRefresh        string
-	QuotaTimeout            string
-	ChatTimeout             string
-	StreamIdleTimeout       string
-	ImageTimeout            string
-	VideoTimeout            string
-	MediaConcurrency        int
-	AllowNSFW               bool
-	RecoveryBackoffBase     string
-	RecoveryBackoffMax      string
+	BaseURL                      string
+	StatsigMode                  string
+	StatsigManualValue           string
+	StatsigManualConfigured      bool
+	StatsigSignerURL             string
+	ClearanceMode                string
+	FlareSolverrURL              string
+	ClearanceTimeout             string
+	ClearanceRefresh             string
+	QuotaTimeout                 string
+	ChatTimeout                  string
+	StreamIdleTimeout            string
+	ImageTimeout                 string
+	VideoTimeout                 string
+	MediaConcurrency             int
+	AllowNSFW                    bool
+	FreeVideoDurationCap         int
+	FreeVideoDurationCapProvided bool
+	RecoveryBackoffBase          string
+	RecoveryBackoffMax           string
 	// ClearanceProvided distinguishes older admin clients that predate the
 	// managed-clearance fields from an explicit update to those fields.
 	ClearanceProvided bool
@@ -135,10 +137,12 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 是管理接口使用的账号池维护策略输入。
 type AccountsConfig struct {
-	MarkBuildForbiddenReauth  bool
-	BuildForbiddenReauthCodes []string
+	AutoDisableDegradedAccounts bool
+	MarkBuildForbiddenReauth    bool
+	BuildForbiddenReauthCodes   []string
 	// ExcludeBuildBotFlaggedFromScheduling drops bot-risk Build accounts from scheduling only.
 	ExcludeBuildBotFlaggedFromScheduling bool
+	AutoDeleteConsoleUnlinked            bool
 	AutoCleanReauthEnabled               bool
 	AutoCleanReauthInterval              string
 	AutoCleanReauthMinAge                string
@@ -149,6 +153,9 @@ type AccountsConfig struct {
 	BuildForbiddenReauthCodesProvided bool
 	// ExcludeBuildBotFlaggedFromSchedulingProvided preserves the value when an older management client omits the field.
 	ExcludeBuildBotFlaggedFromSchedulingProvided bool
+	AutoDeleteConsoleUnlinkedProvided            bool
+	// AutoDisableDegradedAccountsProvided preserves config.yaml when an older management client omits the field.
+	AutoDisableDegradedAccountsProvided bool
 }
 
 // EditableConfig 聚合管理端允许修改的运行参数。
@@ -339,6 +346,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if clearanceRefresh <= 0 {
 		clearanceRefresh = base.Provider.Web.ClearanceRefresh.Value()
 	}
+	freeVideoDurationCap := value.ProviderWeb.FreeVideoDurationCap
+	if freeVideoDurationCap == 0 {
+		freeVideoDurationCap = base.Provider.Web.FreeVideoDurationCap
+	}
 	base.Provider.Web = config.WebProviderConfig{
 		BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: config.Duration(value.ProviderWeb.QuotaTimeout),
 		StatsigMode: value.ProviderWeb.StatsigMode, StatsigManualValue: value.ProviderWeb.StatsigManualValue, StatsigSignerURL: value.ProviderWeb.StatsigSignerURL,
@@ -348,7 +359,8 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		ImageTimeout:     config.Duration(value.ProviderWeb.ImageTimeout),
 		VideoTimeout:     config.Duration(value.ProviderWeb.VideoTimeout),
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
-		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
+		FreeVideoDurationCap: settingsdomain.NormalizeWebFreeVideoDurationCap(freeVideoDurationCap),
+		RecoveryBackoffBase:  config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
 	}
 	if value.ProviderWeb.StreamIdleTimeout <= 0 {
 		base.Provider.Web.StreamIdleTimeout = config.Duration(settingsdomain.DefaultWebStreamIdleTimeout)
@@ -432,12 +444,17 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		base.Accounts.BuildForbiddenReauthCodes = append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...)
 	}
 	base.Accounts.ExcludeBuildBotFlaggedFromScheduling = value.Accounts.ExcludeBuildBotFlaggedFromScheduling
+	base.Accounts.AutoDeleteConsoleUnlinked = value.Accounts.AutoDeleteConsoleUnlinked
+	if value.Accounts.AutoDisableDegradedAccounts != nil {
+		base.QualityGuard.RequestRetry.AutoDisable = *value.Accounts.AutoDisableDegradedAccounts
+	}
 	return base
 }
 
 func toDomainConfig(value config.Config) settingsdomain.Config {
 	randomDelay := value.Batch.RandomDelay.Value()
 	accountIsolatedConnections := value.Routing.AccountIsolatedConnections
+	autoDisableDegradedAccounts := value.QualityGuard.RequestRetry.AutoDisable
 	return settingsdomain.Config{
 		Server: settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
@@ -457,7 +474,8 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			ImageTimeout:     value.Provider.Web.ImageTimeout.Value(),
 			VideoTimeout:     value.Provider.Web.VideoTimeout.Value(),
 			MediaConcurrency: value.Provider.Web.MediaConcurrency, AllowNSFW: value.Provider.Web.AllowNSFW,
-			RecoveryBackoffBase: value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
+			FreeVideoDurationCap: settingsdomain.NormalizeWebFreeVideoDurationCap(value.Provider.Web.FreeVideoDurationCap),
+			RecoveryBackoffBase:  value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
 		},
 		ProviderConsole: settingsdomain.ProviderConsoleConfig{
 			BaseURL: value.Provider.Console.BaseURL, ChatTimeout: value.Provider.Console.ChatTimeout.Value(),
@@ -494,9 +512,11 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
 		},
 		Accounts: settingsdomain.AccountsConfig{
+			AutoDisableDegradedAccounts:          &autoDisableDegradedAccounts,
 			MarkBuildForbiddenReauth:             value.Accounts.MarkBuildForbiddenReauth,
 			BuildForbiddenReauthCodes:            append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...),
 			ExcludeBuildBotFlaggedFromScheduling: value.Accounts.ExcludeBuildBotFlaggedFromScheduling,
+			AutoDeleteConsoleUnlinked:            value.Accounts.AutoDeleteConsoleUnlinked,
 			AutoCleanReauthEnabled:               value.Accounts.AutoCleanReauthEnabled,
 			AutoCleanReauthInterval:              value.Accounts.AutoCleanReauthInterval.Value(),
 			AutoCleanReauthMinAge:                value.Accounts.AutoCleanReauthMinAge.Value(),
@@ -555,6 +575,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	}
 	next.Provider.Web.MediaConcurrency = input.ProviderWeb.MediaConcurrency
 	next.Provider.Web.AllowNSFW = input.ProviderWeb.AllowNSFW
+	if input.ProviderWeb.FreeVideoDurationCapProvided {
+		next.Provider.Web.FreeVideoDurationCap = settingsdomain.NormalizeWebFreeVideoDurationCap(input.ProviderWeb.FreeVideoDurationCap)
+	}
 	next.Provider.Console.BaseURL = strings.TrimSpace(input.ProviderConsole.BaseURL)
 	next.Batch = config.BatchConfig{
 		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
@@ -589,6 +612,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.ClientKeyDefaults.RPMLimit = input.ClientKeyDefaults.RPMLimit
 	next.ClientKeyDefaults.MaxConcurrent = input.ClientKeyDefaults.MaxConcurrent
 	if input.AccountsProvided {
+		if input.Accounts.AutoDisableDegradedAccountsProvided {
+			next.QualityGuard.RequestRetry.AutoDisable = input.Accounts.AutoDisableDegradedAccounts
+		}
 		if input.Accounts.MarkBuildForbiddenReauthProvided {
 			next.Accounts.MarkBuildForbiddenReauth = input.Accounts.MarkBuildForbiddenReauth
 		}
@@ -597,6 +623,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		}
 		if input.Accounts.ExcludeBuildBotFlaggedFromSchedulingProvided {
 			next.Accounts.ExcludeBuildBotFlaggedFromScheduling = input.Accounts.ExcludeBuildBotFlaggedFromScheduling
+		}
+		if input.Accounts.AutoDeleteConsoleUnlinkedProvided {
+			next.Accounts.AutoDeleteConsoleUnlinked = input.Accounts.AutoDeleteConsoleUnlinked
 		}
 		next.Accounts.AutoCleanReauthEnabled = input.Accounts.AutoCleanReauthEnabled
 		next.Accounts.AutoCleanIncludeDisabled = input.Accounts.AutoCleanIncludeDisabled
@@ -689,7 +718,9 @@ func toEditable(cfg config.Config) EditableConfig {
 			ImageTimeout:     cfg.Provider.Web.ImageTimeout.String(),
 			VideoTimeout:     cfg.Provider.Web.VideoTimeout.String(),
 			MediaConcurrency: cfg.Provider.Web.MediaConcurrency, AllowNSFW: cfg.Provider.Web.AllowNSFW,
-			RecoveryBackoffBase: cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
+			FreeVideoDurationCap:         settingsdomain.NormalizeWebFreeVideoDurationCap(cfg.Provider.Web.FreeVideoDurationCap),
+			FreeVideoDurationCapProvided: true,
+			RecoveryBackoffBase:          cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
 		},
 		ProviderConsole: ProviderConsoleConfig{
 			BaseURL: cfg.Provider.Console.BaseURL, ChatTimeout: cfg.Provider.Console.ChatTimeout.String(),
@@ -727,12 +758,16 @@ func toEditable(cfg config.Config) EditableConfig {
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: cfg.ClientKeyDefaults.RPMLimit, MaxConcurrent: cfg.ClientKeyDefaults.MaxConcurrent},
 		Accounts: AccountsConfig{
+			AutoDisableDegradedAccounts:                  cfg.QualityGuard.RequestRetry.AutoDisable,
+			AutoDisableDegradedAccountsProvided:          true,
 			MarkBuildForbiddenReauth:                     cfg.Accounts.MarkBuildForbiddenReauth,
 			BuildForbiddenReauthCodes:                    append([]string(nil), cfg.Accounts.BuildForbiddenReauthCodes...),
 			ExcludeBuildBotFlaggedFromScheduling:         cfg.Accounts.ExcludeBuildBotFlaggedFromScheduling,
+			AutoDeleteConsoleUnlinked:                    cfg.Accounts.AutoDeleteConsoleUnlinked,
 			MarkBuildForbiddenReauthProvided:             true,
 			BuildForbiddenReauthCodesProvided:            true,
 			ExcludeBuildBotFlaggedFromSchedulingProvided: true,
+			AutoDeleteConsoleUnlinkedProvided:            true,
 			AutoCleanReauthEnabled:                       cfg.Accounts.AutoCleanReauthEnabled,
 			AutoCleanReauthInterval:                      cfg.Accounts.AutoCleanReauthInterval.String(),
 			AutoCleanReauthMinAge:                        cfg.Accounts.AutoCleanReauthMinAge.String(),

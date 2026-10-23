@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -60,6 +61,7 @@ type QualityRetryRuntime struct {
 	HoldTimeout     time.Duration
 	MinOutputTokens int64
 	OnExhausted     string
+	AutoDisable     bool
 	AccountCooldown time.Duration
 	// IdleAccountCooldown is applied to truly empty upstream streams
 	// (idle timeout / empty peek). Missing-thinking still uses AccountCooldown.
@@ -202,16 +204,19 @@ func (s *Service) qualityRetryConfig() QualityRetryRuntime {
 
 // encryptedThinkingFloor is max(minBytes, reasoningTokens*bytesPerToken).
 // A non-empty stub such as "gAAAA-cipher" is not thinking.
-func encryptedThinkingFloor(minBytes, bytesPerToken int, reasoningTokens int64) int {
+func encryptedThinkingFloor(minBytes, bytesPerToken int, reasoningTokens int64) int64 {
 	if minBytes <= 0 {
 		minBytes = defaultMinEncryptedBytes
 	}
 	if bytesPerToken <= 0 {
 		bytesPerToken = defaultEncryptedBytesPerReasoningToken
 	}
-	floor := minBytes
+	floor := int64(minBytes)
 	if reasoningTokens > 0 {
-		need := int(reasoningTokens) * bytesPerToken
+		if reasoningTokens > math.MaxInt64/int64(bytesPerToken) {
+			return math.MaxInt64
+		}
+		need := reasoningTokens * int64(bytesPerToken)
 		if need > floor {
 			floor = need
 		}
@@ -233,7 +238,7 @@ func qualityMeetsEncryptedFloor(sig QualityStreamSignals) bool {
 	if sig.EncryptedBytes <= 0 {
 		return false
 	}
-	return sig.EncryptedBytes >= encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
+	return int64(sig.EncryptedBytes) >= encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
 }
 
 func qualityHasDumpBill(sig QualityStreamSignals) bool {
@@ -448,16 +453,7 @@ func qualityPeekAbortError(ctx context.Context, err error) error {
 // isClientRequestCancel reports a real client disconnect. Upstream idle
 // timeouts cancel the same context and must not be classified as 499.
 func isClientRequestCancel(ctx context.Context, err error) bool {
-	if neterrorpkg.IsUpstreamStreamIdleTimeout(err) {
-		return false
-	}
-	if ctx != nil && neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx)) {
-		return false
-	}
-	if ctx != nil && ctx.Err() != nil {
-		return true
-	}
-	return errors.Is(err, context.Canceled)
+	return neterrorpkg.IsClientRequestCancel(ctx, err)
 }
 
 // DecideQualityRetry caps withhold recovery at maxAttempts (default 6:
@@ -552,6 +548,15 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 		return true
 	}
 	return modeldomain.SupportsReasoningForProvider(route.Provider, route.UpstreamModel)
+}
+
+// canReplayQualityHoldAcrossAccounts separates response classification from
+// retry authority. Stored Responses are account-bound, while hosted tools may
+// already have produced an external side effect before their held response is
+// rejected. Both may be held, audited, and penalized, but neither is replayed
+// on another account.
+func canReplayQualityHoldAcrossAccounts(input Input, ownership *inferencedomain.ResponseOwnership) bool {
+	return ownership == nil && !qualityRequestHasReplayUnsafeHostedTools(input.Body)
 }
 
 func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {
@@ -655,10 +660,10 @@ func jsonStringEquals(raw json.RawMessage, want string) bool {
 	return json.Unmarshal(raw, &value) == nil && strings.EqualFold(strings.TrimSpace(value), want)
 }
 
-func (s *Service) applyMissingThinkingPenalty(ctx context.Context, requestID string, credential accountdomain.Credential, cooldown time.Duration) {
+func (s *Service) applyMissingThinkingPenalty(ctx context.Context, requestID string, credential accountdomain.Credential, cooldown time.Duration, autoDisable bool) {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
 	defer cancel()
-	action, err := s.selector.markMissingThinking(writeCtx, credential, cooldown)
+	action, err := s.selector.markMissingThinking(writeCtx, credential, cooldown, autoDisable)
 	if err != nil {
 		s.logger.Error("quality_degraded_penalty_failed", "request_id", requestID, "account_id", credential.ID, "action", action, "error", err)
 		return

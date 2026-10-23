@@ -31,6 +31,7 @@ func TestSelectionUnavailableErrorClassification(t *testing.T) {
 		{reason: SelectionModelCooling, status: http.StatusTooManyRequests, code: "upstream_model_cooling"},
 		{reason: SelectionQuotaExhausted, status: http.StatusTooManyRequests, code: "upstream_quota_exhausted"},
 		{reason: SelectionSaturated, status: http.StatusServiceUnavailable, code: "upstream_saturated"},
+		{reason: SelectionPinnedUnavailable, status: http.StatusServiceUnavailable, code: "upstream_pinned_account_unavailable"},
 	}
 	for _, test := range tests {
 		t.Run(string(test.reason), func(t *testing.T) {
@@ -39,6 +40,43 @@ func TestSelectionUnavailableErrorClassification(t *testing.T) {
 				t.Fatalf("status=%d code=%q", failure.HTTPStatus(), failure.Code())
 			}
 		})
+	}
+}
+
+func TestAcquirePinnedMissingAccountIsNotEmptyPool(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-pinned-miss.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	live, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "live", SourceKey: "live", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.AcquireForKey(ctx, account.ProviderBuild, 0, "", "", "", nil, false, clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Credential.ID != live.ID {
+		t.Fatalf("pool account = %d", lease.Credential.ID)
+	}
+	lease.Release()
+	_, err = selector.AcquirePinnedForKey(ctx, account.ProviderBuild, live.ID+99, 0, "", "", true, clientkeydomain.AccountScope{})
+	var unavailable *SelectionUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionPinnedUnavailable || unavailable.AccountID != live.ID+99 {
+		t.Fatalf("pinned miss = %v", err)
+	}
+	if unavailable.Code() == "upstream_unavailable" {
+		t.Fatal("pinned miss must not collapse to empty-pool unavailable")
 	}
 }
 
@@ -1598,7 +1636,7 @@ func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
 	}
 	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
 	before := time.Now().UTC()
-	if action, err := selector.markMissingThinking(ctx, credential, time.Hour); err != nil || action != missingThinkingPenaltyCooled {
+	if action, err := selector.markMissingThinking(ctx, credential, time.Hour, false); err != nil || action != missingThinkingPenaltyCooled {
 		t.Fatalf("first penalty = (%s, %v)", action, err)
 	}
 	first, err := accounts.Get(ctx, credential.ID)
@@ -1611,7 +1649,7 @@ func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
 	if wait := first.CooldownUntil.Sub(before); wait < 50*time.Minute || wait > 70*time.Minute {
 		t.Fatalf("first cooldown = %s", wait)
 	}
-	if action, err := selector.markMissingThinking(ctx, first, time.Hour); err != nil || action != missingThinkingPenaltyUnchanged {
+	if action, err := selector.markMissingThinking(ctx, first, time.Hour, false); err != nil || action != missingThinkingPenaltyUnchanged {
 		t.Fatalf("in-cooldown penalty = (%s, %v)", action, err)
 	}
 	stillCooling, err := accounts.Get(ctx, credential.ID)
@@ -1623,7 +1661,7 @@ func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
 	}
 	expired := time.Now().UTC().Add(-time.Second)
 	stillCooling.CooldownUntil = &expired
-	if action, err := selector.markMissingThinking(ctx, stillCooling, time.Hour); err != nil || action != missingThinkingPenaltyDisabled {
+	if action, err := selector.markMissingThinking(ctx, stillCooling, time.Hour, false); err != nil || action != missingThinkingPenaltyDisabled {
 		t.Fatalf("second penalty = (%s, %v)", action, err)
 	}
 	second, err := accounts.Get(ctx, credential.ID)
@@ -1644,7 +1682,7 @@ func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action, err := selector.markMissingThinking(ctx, ok, time.Hour); err != nil || action != missingThinkingPenaltyCooled {
+	if action, err := selector.markMissingThinking(ctx, ok, time.Hour, false); err != nil || action != missingThinkingPenaltyCooled {
 		t.Fatalf("recovery penalty = (%s, %v)", action, err)
 	}
 	cooled, err := accounts.Get(ctx, ok.ID)
@@ -1658,6 +1696,24 @@ func TestMarkMissingThinkingCoolsThenDisables(t *testing.T) {
 	}
 	if kept.LastError != lastErrorMissingThinking || kept.CooldownUntil != nil || kept.FailureCount != 0 {
 		t.Fatalf("success must keep thinking strike and clear cooldown, got %#v", kept)
+	}
+
+	immediate, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "auto-disable", SourceKey: "auto-disable", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action, err := selector.markMissingThinking(ctx, immediate, time.Hour, true); err != nil || action != missingThinkingPenaltyDisabled {
+		t.Fatalf("auto-disable penalty = (%s, %v)", action, err)
+	}
+	disabled, err := accounts.Get(ctx, immediate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Enabled || disabled.LastError != lastErrorMissingThinkingDisabled || disabled.CooldownUntil != nil {
+		t.Fatalf("auto-disable first strike = %#v", disabled)
 	}
 }
 
@@ -1787,6 +1843,133 @@ func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	}
 }
 
+func TestBoundUpstreamRetryAfter(t *testing.T) {
+	selector := &Selector{cooldownMax: time.Minute}
+	tests := []struct {
+		name string
+		input time.Duration
+		want  time.Duration
+	}{
+		{name: "empty", input: 0, want: 0},
+		{name: "negative", input: -time.Second, want: -time.Second},
+		{name: "within maximum", input: 30 * time.Second, want: 30 * time.Second},
+		{name: "above maximum", input: 2 * time.Minute, want: time.Minute},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := selector.boundUpstreamRetryAfter(test.input); got != test.want {
+				t.Fatalf("boundUpstreamRetryAfter(%s) = %s, want %s", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestMarkFailureBoundsUpstreamRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "retry-after-bound.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "retry-after-bound", SourceKey: "retry-after-bound", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 500*time.Millisecond)
+	before := time.Now().UTC()
+	selector.MarkFailure(ctx, credential, http.StatusTooManyRequests, 24*time.Hour)
+	updated, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.CooldownUntil == nil {
+		t.Fatal("expected cooldown")
+	}
+	cooldown := updated.CooldownUntil.Sub(before)
+	if cooldown < 50*time.Second || cooldown > 70*time.Second {
+		t.Fatalf("upstream Retry-After cooldown = %s, want at most cooldownMax (~1m)", cooldown)
+	}
+}
+
+func TestMarkSoftFailureBoundsUpstreamRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "soft-retry-after-bound.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "soft-retry-after-bound", SourceKey: "soft-retry-after-bound", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 500*time.Millisecond)
+	before := time.Now().UTC()
+	if err := selector.markSoftFailure(ctx, credential, http.StatusServiceUnavailable, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.CooldownUntil == nil {
+		t.Fatal("expected cooldown")
+	}
+	cooldown := updated.CooldownUntil.Sub(before)
+	if cooldown < 50*time.Second || cooldown > 70*time.Second {
+		t.Fatalf("soft upstream Retry-After cooldown = %s, want at most cooldownMax (~1m)", cooldown)
+	}
+}
+
+func TestMarkFailureAfterSuccessPreservesExplicitCooldown(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "after-success-cooldown.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "after-success-cooldown", SourceKey: "after-success-cooldown", EncryptedAccessToken: "encrypted", Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 500*time.Millisecond)
+	before := time.Now().UTC()
+	if err := selector.MarkFailureAfterSuccess(ctx, credential, http.StatusGatewayTimeout, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.CooldownUntil == nil {
+		t.Fatal("expected cooldown")
+	}
+	cooldown := updated.CooldownUntil.Sub(before)
+	if cooldown < 119*time.Minute || cooldown > 121*time.Minute {
+		t.Fatalf("explicit after-success cooldown = %s, want ~2h", cooldown)
+	}
+}
+
 func TestConsoleRateLimitReconciliationUsesNonAccumulatingCooldown(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1798,7 +1981,9 @@ func TestConsoleRateLimitReconciliationUsesNonAccumulatingCooldown(t *testing.T)
 		{name: "quota confirmed available", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 3},
 		{name: "another replica refreshing", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileRefreshing, wantFailureCount: 3},
 		{name: "quota probe inconclusive", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileInconclusive, err: errors.New("usage probe failed"), wantFailureCount: 3},
-		{name: "payment failure keeps hard penalty", status: http.StatusPaymentRequired, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 4},
+		// 402 spending-limit is authoritative even while the lagging usage panel
+		// still shows budget: pause via quota recovery, never grow failures.
+		{name: "payment failure pauses until probe", status: http.StatusPaymentRequired, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 3},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1840,16 +2025,22 @@ func TestConsoleRateLimitReconciliationUsesNonAccumulatingCooldown(t *testing.T)
 			if updated.FailureCount != test.wantFailureCount {
 				t.Fatalf("failure count = %d, want %d", updated.FailureCount, test.wantFailureCount)
 			}
+			if test.status == http.StatusPaymentRequired {
+				recovery, err := accounts.GetQuotaRecovery(ctx, credential.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if recovery.Status != account.QuotaRecoveryStatusExhausted || recovery.NextProbeAt == nil || recovery.NextProbeAt.Before(before.Add(23*time.Hour)) {
+					t.Fatalf("quota recovery = %#v", recovery)
+				}
+				return
+			}
 			if updated.CooldownUntil == nil {
 				t.Fatal("expected Console 429 cooldown")
 			}
 			cooldown := updated.CooldownUntil.Sub(before)
-			if test.status == http.StatusTooManyRequests {
-				if cooldown < 11*time.Second || cooldown > 13*time.Second {
-					t.Fatalf("cooldown = %s, want ~12s", cooldown)
-				}
-			} else if cooldown < 2*time.Minute {
-				t.Fatalf("hard failure cooldown = %s, want at least 2m", cooldown)
+			if cooldown < 11*time.Second || cooldown > 13*time.Second {
+				t.Fatalf("cooldown = %s, want ~12s", cooldown)
 			}
 		})
 	}

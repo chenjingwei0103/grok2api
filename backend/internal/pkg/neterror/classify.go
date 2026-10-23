@@ -1,6 +1,7 @@
 package neterror
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
@@ -18,6 +19,11 @@ var ErrUpstreamStreamIdleTimeout = errors.New("upstream stream idle timeout")
 // JSON and client cancellation so callers may apply the empty-response health
 // policy without penalizing ordinary request aborts.
 var ErrUpstreamResponseEmpty = errors.New("upstream response body is empty")
+
+// ErrUpstreamOutputLoop is raised when the gateway terminates a stream because
+// the model repeated the same visible or reasoning delta past the doom-loop
+// guard. It is distinct from a transport cut (upstream_stream_interrupted).
+var ErrUpstreamOutputLoop = errors.New("model output loop detected")
 
 // ErrBuildStreamIdleTimeout is retained as a compatibility alias for callers
 // introduced before stream-idle protection became provider-neutral.
@@ -54,6 +60,12 @@ func IsUpstreamResponseEmpty(err error) bool {
 	return errors.Is(err, ErrUpstreamResponseEmpty)
 }
 
+// IsUpstreamOutputLoop reports whether the stream was aborted by the repeated
+// delta doom-loop guard rather than a transport interrupt.
+func IsUpstreamOutputLoop(err error) bool {
+	return errors.Is(err, ErrUpstreamOutputLoop)
+}
+
 // IdleTimeoutError retains whether any response bytes arrived before an idle
 // deadline. A zero-byte idle may use the long account cooldown; a partial
 // response should receive only the ordinary transient failure penalty.
@@ -69,4 +81,28 @@ func (e *IdleTimeoutError) Unwrap() error { return ErrUpstreamStreamIdleTimeout 
 func IdleTimeoutObservedData(err error) bool {
 	var idle *IdleTimeoutError
 	return errors.As(err, &idle) && idle.DataObserved
+}
+
+// IsClientRequestCancel reports a real client disconnect.
+// Internal aborts (idle timeout, first-char timeout, …) cancel the same
+// context with a cause other than context.Canceled and must not be treated
+// as the client hanging up. Pre-header client cancel still maps to 499
+// request_canceled; a 2xx stream copy uses client_stream_interrupted.
+func IsClientRequestCancel(ctx context.Context, err error) bool {
+	if IsUpstreamStreamIdleTimeout(err) {
+		return false
+	}
+	if ctx != nil {
+		cause := context.Cause(ctx)
+		if IsUpstreamStreamIdleTimeout(cause) {
+			return false
+		}
+		if ctx.Err() != nil {
+			if cause != nil && !errors.Is(cause, context.Canceled) {
+				return false
+			}
+			return true
+		}
+	}
+	return errors.Is(err, context.Canceled)
 }

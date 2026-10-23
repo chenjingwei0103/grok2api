@@ -69,12 +69,13 @@ type codexModelCatalog struct {
 }
 
 var codexReasoningDescriptions = map[string]string{
-	"none":   "No reasoning",
-	"low":    "Fast responses with lighter reasoning",
-	"medium": "Balances speed and reasoning depth for everyday tasks",
-	"high":   "Greater reasoning depth for complex problems",
-	"xhigh":  "Extra high reasoning depth for complex problems",
-	"max":    "Maximum reasoning depth for the hardest problems",
+	"none":    "No reasoning",
+	"minimal": "Minimal reasoning for the fastest responses",
+	"low":     "Fast responses with lighter reasoning",
+	"medium":  "Balances speed and reasoning depth for everyday tasks",
+	"high":    "Greater reasoning depth for complex problems",
+	"xhigh":   "Extra high reasoning depth for complex problems",
+	"max":     "Maximum reasoning depth for the hardest problems",
 }
 
 type grokModelCapability struct {
@@ -88,6 +89,7 @@ type grokModelCapability struct {
 var grokCapabilities = map[string]grokModelCapability{
 	"grok-4.5":                     {500000, "xAI Grok 4.5 frontier model with reasoning and vision.", true},
 	"grok-4.6":                     {500000, "xAI Grok 4.6 frontier model with reasoning and vision.", true},
+	"grok-4.7":                     {500000, "xAI Grok 4.7 frontier model with reasoning and vision.", true},
 	"grok-4.3":                     {1000000, "xAI Grok 4.3 high-capacity reasoning model.", true},
 	"grok-build-0.1":               {256000, "xAI Grok Build 0.1 coding model.", false},
 	"grok-4.20-0309-reasoning":     {2000000, "xAI Grok 4.20 reasoning model.", true},
@@ -109,10 +111,18 @@ func lookupGrokCapability(providerValue account.Provider, slug string) (grokMode
 		slug = base
 	}
 	levels := modeldomain.SupportedReasoningEffortsForProvider(providerValue, slug)
-	if capability, ok := grokCapabilities[slug]; ok {
-		return capability, levels
+	capability, ok := grokCapabilities[slug]
+	if !ok {
+		capability = grokDefaultCapability
 	}
-	return grokDefaultCapability, levels
+	// The live Build catalog (context_window) is authoritative over the static
+	// table once an account has synchronized it, exactly like grok-build.
+	if providerValue == account.ProviderBuild {
+		if profile, exists := modeldomain.UpstreamProfile(slug); exists && profile.ContextWindow > 0 {
+			capability.contextWindow = profile.ContextWindow
+		}
+	}
+	return capability, levels
 }
 
 func codexVisibilityForCapability(capability modeldomain.Capability) string {

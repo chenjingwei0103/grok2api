@@ -168,8 +168,12 @@ qualityGuard:
     holdTimeout: 30s
     minOutputTokens: 32
     onExhausted: fail_closed # fail_open | fail_closed
-    # First missing-thinking hit cools the account; a later hit after the
-    # cooldown expires disables it.
+    # Immediately disable an account on its first confirmed missing-thinking
+    # or degraded output-speed hit (soft-TPS, hard-TPS, or buffered-burst).
+    # Also enables request-path detection independently of enabled above.
+    # When false, enabled controls the historical cooldown/second-hit policy.
+    # Context compaction and forced egress probes remain exempt.
+    autoDisable: false
     accountCooldown: 12h
     # Empty SSE / idle-timeout penalty. Independent of accountCooldown.
     # Single-account pools should set this lower; toggling enabled does not

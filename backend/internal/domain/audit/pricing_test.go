@@ -28,6 +28,7 @@ func TestEstimateOfficialCostMatchesControlledModelFamilies(t *testing.T) {
 	}{
 		{model: "Build/grok-build-0.1", canonical: "grok-build-0.1"},
 		{model: "Console/grok-4.6-latest", canonical: "grok-4.6"},
+		{model: "Build/grok-4.7-xhigh", canonical: "grok-4.7"},
 		{model: "grok_build/grok-code-fast-1-0825", canonical: "grok-build-0.1"},
 		{model: "Console/grok-4.3-high", canonical: "grok-4.3"},
 		{model: "Web/grok-4.5-2026-07-14", canonical: "grok-4.5"},

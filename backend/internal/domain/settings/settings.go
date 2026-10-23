@@ -15,7 +15,18 @@ const (
 	DefaultConsoleStreamIdleTimeout = 2 * time.Minute
 	MinProviderStreamIdleTimeout    = 30 * time.Second
 	MaxProviderStreamIdleTimeout    = 10 * time.Minute
+
+	DefaultWebFreeVideoDurationCap = 6
+	MinWebFreeVideoDurationCap     = 1
+	MaxWebFreeVideoDurationCap     = 15
 )
+
+func NormalizeWebFreeVideoDurationCap(value int) int {
+	if value < MinWebFreeVideoDurationCap || value > MaxWebFreeVideoDurationCap {
+		return DefaultWebFreeVideoDurationCap
+	}
+	return value
+}
 
 // Config 表示可跨重启持久化并支持热加载的网关运行参数。
 type Config struct {
@@ -56,23 +67,24 @@ type MediaConfig struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL             string
-	StatsigMode         string
-	StatsigManualValue  string
-	StatsigSignerURL    string
-	ClearanceMode       string
-	FlareSolverrURL     string
-	ClearanceTimeout    time.Duration
-	ClearanceRefresh    time.Duration
-	QuotaTimeout        time.Duration
-	ChatTimeout         time.Duration
-	StreamIdleTimeout   time.Duration
-	ImageTimeout        time.Duration
-	VideoTimeout        time.Duration
-	MediaConcurrency    int
-	AllowNSFW           bool
-	RecoveryBackoffBase time.Duration
-	RecoveryBackoffMax  time.Duration
+	BaseURL              string
+	StatsigMode          string
+	StatsigManualValue   string
+	StatsigSignerURL     string
+	ClearanceMode        string
+	FlareSolverrURL      string
+	ClearanceTimeout     time.Duration
+	ClearanceRefresh     time.Duration
+	QuotaTimeout         time.Duration
+	ChatTimeout          time.Duration
+	StreamIdleTimeout    time.Duration
+	ImageTimeout         time.Duration
+	VideoTimeout         time.Duration
+	MediaConcurrency     int
+	AllowNSFW            bool
+	FreeVideoDurationCap int
+	RecoveryBackoffBase  time.Duration
+	RecoveryBackoffMax   time.Duration
 }
 
 // BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。
@@ -135,6 +147,9 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 定义账号池后台维护策略；默认全部关闭。
 type AccountsConfig struct {
+	// AutoDisableDegradedAccounts is optional so legacy persisted settings keep
+	// the qualityGuard.requestRetry.autoDisable value supplied by config.yaml.
+	AutoDisableDegradedAccounts *bool
 	// MarkBuildForbiddenReauth marks high-confidence Grok Build permission denials as requiring reauthorization.
 	MarkBuildForbiddenReauth bool
 	// BuildForbiddenReauthCodes contains exact upstream error codes that opt into account invalidation.
@@ -142,6 +157,8 @@ type AccountsConfig struct {
 	// ExcludeBuildBotFlaggedFromScheduling 为 true 时，bot_flag_source/bfs∈{1,2} 的 Build 账号不参与调度。
 	// 仅影响 ProviderBuild 选号；关联 Web/Console 账号调度不受影响。
 	ExcludeBuildBotFlaggedFromScheduling bool
+	// AutoDeleteConsoleUnlinked 为 true 时，删除被判定为未与 Cursor 关联（无 Console 额度）的 grok_console 老号；默认 false 仅标记失效。
+	AutoDeleteConsoleUnlinked bool
 	// AutoCleanReauthEnabled 为 true 时，周期性删除已标记 reauthRequired 且超过 minAge 的账号。
 	AutoCleanReauthEnabled bool
 	// AutoCleanReauthInterval 自动清理扫描间隔。

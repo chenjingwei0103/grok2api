@@ -279,7 +279,7 @@ func TestNormalizeResponsesRequestRemovesNullableFunctionParameterRoot(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_nullable_root_normalized") {
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_root_normalized") {
 		t.Fatalf("compatibility = %#v", compatibility)
 	}
 	var payload map[string]any
@@ -304,7 +304,7 @@ func TestNormalizeResponsesRequestSimplifiesNullableNonObjectFunctionRoot(t *tes
 	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello",
 		"tools":[{"type":"function","name":"invalid","parameters":{
-			"anyOf":[{"type":"object"},{"type":"string"},{"type":"null"}]
+			"anyOf":[{"type":"string"},{"type":"null"}]
 		}}]
 	}`), "grok-4.5")
 	if err != nil {
@@ -313,7 +313,7 @@ func TestNormalizeResponsesRequestSimplifiesNullableNonObjectFunctionRoot(t *tes
 	assertSimplifiedBuildFunctionParameters(t, normalized, compatibility, "invalid")
 }
 
-func TestNormalizeResponsesRequestSimplifiesNullableLocalRefFunctionRoot(t *testing.T) {
+func TestNormalizeResponsesRequestNormalizesNullableLocalRefFunctionRoot(t *testing.T) {
 	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
 		"model":"public","input":"hello",
 		"tools":[{"type":"function","name":"lookup","parameters":{
@@ -328,7 +328,17 @@ func TestNormalizeResponsesRequestSimplifiesNullableLocalRefFunctionRoot(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertSimplifiedBuildFunctionParameters(t, normalized, compatibility, "lookup")
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "function_parameters_root_normalized") {
+		t.Fatalf("compatibility = %#v", compatibility)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	parameters := payload["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)
+	if parameters["type"] != "object" || parameters["anyOf"] != nil {
+		t.Fatalf("upstream parameters = %#v", parameters)
+	}
 	visibleParameters := compatibility.visibleTools[0].(map[string]any)["parameters"].(map[string]any)
 	visibleBranches := visibleParameters["anyOf"].([]any)
 	if len(visibleBranches) != 2 || visibleParameters["type"] != nil {
@@ -451,6 +461,15 @@ func TestNormalizeBuildFunctionParametersRootVariants(t *testing.T) {
 		{
 			name:   "type array",
 			schema: map[string]any{"type": []any{"object", "null"}, "properties": map[string]any{}},
+			check: func(t *testing.T, normalized map[string]any, changed bool) {
+				if !changed || normalized["type"] != "object" {
+					t.Fatalf("normalized=%#v changed=%v", normalized, changed)
+				}
+			},
+		},
+		{
+			name:   "single object type array",
+			schema: map[string]any{"type": []any{"object"}, "properties": map[string]any{}},
 			check: func(t *testing.T, normalized map[string]any, changed bool) {
 				if !changed || normalized["type"] != "object" {
 					t.Fatalf("normalized=%#v changed=%v", normalized, changed)

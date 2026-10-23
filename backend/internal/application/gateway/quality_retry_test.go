@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -317,6 +318,13 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 	}
 }
 
+func TestEncryptedThinkingFloorSaturates(t *testing.T) {
+	t.Parallel()
+	if got := encryptedThinkingFloor(256, 16, math.MaxInt64); got != math.MaxInt64 {
+		t.Fatalf("overflowing floor = %d, want %d", got, int64(math.MaxInt64))
+	}
+}
+
 func TestDecideQualityRetry(t *testing.T) {
 	t.Parallel()
 	if got := DecideQualityRetry(QualityDeliver, 0, 2, qualityRetryFailOpen); got != QualityActionDeliver {
@@ -624,8 +632,47 @@ func TestObserveQualityConvertedEncryptedThinking(t *testing.T) {
 			if !sig.HasThinking {
 				t.Fatalf("converted encrypted thinking evidence was lost:\n%s", converted)
 			}
-			if got := ClassifyQualityHold(sig, 32); got != QualityDeliver {
-				t.Fatalf("converted encrypted thinking verdict = %s (%#v)", got, sig)
+			if got := ClassifyQualityHold(sig, 32); got != QualityWithhold {
+				t.Fatalf("converted cipher dump without plaintext deltas must withhold: %s (%#v)", got, sig)
+			}
+		})
+	}
+}
+
+func TestObserveQualityConvertedShortEncryptedStubDoesNotBypassFloor(t *testing.T) {
+	t.Parallel()
+	const stub = "gAAAA-cipher"
+	source := sse(
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`,
+		`data: {"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning"}}`,
+		`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"`+stub+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"`+strings.Repeat("word ", 40)+`"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.6","usage":{"output_tokens":90,"output_tokens_details":{"reasoning_tokens":60}}}}`,
+	)
+	for _, test := range []struct {
+		name      string
+		operation string
+		protocol  string
+		options   conversation.ResponseOptions
+	}{
+		{name: "chat", operation: conversation.OperationChat, protocol: qualityProtocolChat},
+		{name: "messages", operation: conversation.OperationMessages, protocol: qualityProtocolAnthropic, options: conversation.ResponseOptions{AnthropicThinking: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			converted, err := io.ReadAll(conversation.ConvertResponseStreamWithOptions(
+				io.NopCloser(strings.NewReader(source)), test.operation, test.options,
+			))
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := qualityScanState{protocol: test.protocol}
+			ObserveQualityChunk(&state, converted)
+			sig := state.signals()
+			if sig.HasThinking || sig.EncryptedBytes != len(stub) || !sig.ReasoningStarted {
+				t.Fatalf("converted short stub signals = %#v\n%s", sig, converted)
+			}
+			if got := ClassifyQualityHold(sig, 32); got != QualityWithhold {
+				t.Fatalf("converted short stub verdict = %s, want withhold", got)
 			}
 		})
 	}
@@ -1913,6 +1960,9 @@ func TestAttemptLoopQualityHold(t *testing.T) {
 	attempts := adapter.Attempts()
 	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
 		t.Fatalf("expected empty+no-think account exclusion and retry, attempts=%#v", attempts)
+	}
+	if got := adapter.TransientRetries(); len(got) != 3 || got[0] != 0 || got[1] != 0 || got[2] != 0 {
+		t.Fatalf("quality retries must not be reported as transient retries: %#v", got)
 	}
 	emptyAccount, err := accountRepo.Get(ctx, credentials[0].ID)
 	if err != nil {

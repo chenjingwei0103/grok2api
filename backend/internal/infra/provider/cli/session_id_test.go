@@ -27,3 +27,19 @@ func TestGrokSessionIDStableForSameKey(t *testing.T) {
 		t.Fatalf("unstable: first=%q second=%q err=%v", first, second, err)
 	}
 }
+
+func TestGrokConversationGroupIDMatchesGrokBuildDerivation(t *testing.T) {
+	// Reference vector: uuid5(NAMESPACE_OID, "xai:grok-build:conversation-group:" + root_session_id),
+	// identical to xai-grok-shell `derive_conversation_group_id`.
+	const root = "0f4c7a1e-6c1b-5a0e-8e6c-3b0f6a6a2a1d"
+	got := grokConversationGroupID(root)
+	if got != "d5de345a-3509-59bc-b73c-7d33029d840b" {
+		t.Fatalf("conversation group id = %q", got)
+	}
+	if again := grokConversationGroupID(root); again != got {
+		t.Fatalf("unstable: first=%q second=%q", got, again)
+	}
+	if other := grokConversationGroupID("another-root"); other == got {
+		t.Fatalf("different roots must not share a group id: %q", other)
+	}
+}

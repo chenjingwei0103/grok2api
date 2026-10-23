@@ -47,9 +47,9 @@ func TestSettingsResponseIncludesBuildTokenAuth(t *testing.T) {
 
 func TestSettingsResponseIncludesRecommendedBuildBaseline(t *testing.T) {
 	response := newSettingsResponse(settingsapp.Snapshot{RecommendedProviderBuild: settingsapp.ProviderBuildRecommendation{
-		ClientVersion: "1.0.4", UserAgent: "grok-shell/1.0.4 (linux; x86_64)",
+		ClientVersion: "1.0.60", UserAgent: "grok-shell/1.0.60 (linux; x86_64)",
 	}})
-	if response.RecommendedProviderBuild.ClientVersion != "1.0.4" || response.RecommendedProviderBuild.UserAgent == "" {
+	if response.RecommendedProviderBuild.ClientVersion != "1.0.60" || response.RecommendedProviderBuild.UserAgent == "" {
 		t.Fatalf("recommended build = %#v", response.RecommendedProviderBuild)
 	}
 }
@@ -109,6 +109,32 @@ func TestAccountIsolationSettingsPresenceIsPreserved(t *testing.T) {
 	}
 }
 
+func TestFreeVideoDurationCapPresenceIsPreserved(t *testing.T) {
+	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
+		ProviderWeb: settingsapp.ProviderWebConfig{FreeVideoDurationCap: 8},
+	}})
+	if response.Config.ProviderWeb.FreeVideoDurationCap == nil || *response.Config.ProviderWeb.FreeVideoDurationCap != 8 {
+		t.Fatal("freeVideoDurationCap was lost from settings response")
+	}
+
+	var legacy settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"providerWeb":{"baseURL":"https://grok.com"}}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.toApplication().ProviderWeb.FreeVideoDurationCapProvided {
+		t.Fatal("missing freeVideoDurationCap was treated as an explicit update")
+	}
+
+	var explicit settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"providerWeb":{"freeVideoDurationCap":8}}`), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	input := explicit.toApplication()
+	if !input.ProviderWeb.FreeVideoDurationCapProvided || input.ProviderWeb.FreeVideoDurationCap != 8 {
+		t.Fatalf("explicit freeVideoDurationCap was lost: %#v", input.ProviderWeb)
+	}
+}
+
 func TestLegacySettingsRequestMayOmitAccounts(t *testing.T) {
 	var dto settingsConfigDTO
 	if err := json.Unmarshal([]byte(`{"server":{"maxConcurrentRequests":64}}`), &dto); err != nil {
@@ -126,7 +152,7 @@ func TestLegacySettingsRequestPreservesBuildForbiddenCodesWhenOmitted(t *testing
 		t.Fatal(err)
 	}
 	input := dto.toApplication()
-	if !input.AccountsProvided || !input.Accounts.MarkBuildForbiddenReauthProvided || input.Accounts.BuildForbiddenReauthCodesProvided {
+	if !input.AccountsProvided || !input.Accounts.MarkBuildForbiddenReauthProvided || input.Accounts.BuildForbiddenReauthCodesProvided || input.Accounts.AutoDisableDegradedAccountsProvided {
 		t.Fatalf("legacy field presence was not preserved: %#v", input.Accounts)
 	}
 }

@@ -21,7 +21,13 @@ var (
 	ErrAuthorizationDenied  = errors.New("authorization denied")
 	ErrCredentialLimit      = errors.New("credential count exceeds limit")
 	ErrUnauthorized         = errors.New("upstream credential unauthorized")
-	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
+	// ErrConsoleUnlinked accompanies ErrUnauthorized for Grok Console accounts
+	// never linked to Cursor; they have no Console credit pool at all.
+	ErrConsoleUnlinked = errors.New("grok console account not linked to cursor")
+	// ErrEgressBlocked marks a request skipped locally because its egress is
+	// in a Cloudflare block cool-down; no upstream call was made.
+	ErrEgressBlocked       = errors.New("egress blocked by cloudflare, waiting for cool-down")
+	ErrBirthDateAlreadySet = errors.New("upstream birth date is already set")
 )
 
 // HTTPStatusError preserves the upstream status when a streaming or asynchronous Provider cannot return a Response.
@@ -360,10 +366,13 @@ type ResponseResourceRequest struct {
 	AllowClientToolCacheRoute bool
 	// GrokTurnIndex is the explicit Grok Shell client turn; it is validated before Build egress and never fabricated by the server.
 	GrokTurnIndex string
-	IdempotencyID string
-	Streaming     bool
-	NormalizeBody bool
-	Operation     string
+	// TransientRetry is the one-based turn resubmission attempt. Zero marks the
+	// initial submission and is omitted from the upstream request.
+	TransientRetry int
+	IdempotencyID  string
+	Streaming      bool
+	NormalizeBody  bool
+	Operation      string
 	// NormalizedMetadata receives non-sensitive metadata from the exact payload
 	// normalization used for the physical upstream request. The caller owns the
 	// value; adapters update it synchronously before network I/O.
@@ -385,9 +394,15 @@ type Response struct {
 	QuotaUnits  int
 	UpstreamURL string
 	Diagnostic  *DiagnosticResponse
+	// ReasoningRecoveryFailed is an internal retry hint emitted only after the Build
+	// adapter exhausts same-account recovery for an opaque reasoning 400. Gateway
+	// policy must not infer this state from an upstream-controlled response header.
+	ReasoningRecoveryFailed bool
 	// RecoveredPrimaryFailure records a primary-plane failure hidden by a successful Provider fallback.
 	RecoveredPrimaryFailure *DiagnosticResponse
-	RateLimit               *RateLimitMetadata
+	// RecoveredAttempts 保存被 adapter 内部恢复流程隐藏、但仍需进入请求审计的上游调用。
+	RecoveredAttempts []RecoveredAttempt
+	RateLimit         *RateLimitMetadata
 	// ModelCatalogChanged indicates that the model catalog ETag in an inference response differs from
 	// the ETag from the account's most recent successful /models sync.
 	ModelCatalogChanged bool
@@ -419,6 +434,17 @@ type DiagnosticResponse struct {
 	BodyTruncated bool
 }
 
+// RecoveredAttempt 表示一次被后续恢复结果替代的真实上游调用。
+type RecoveredAttempt struct {
+	Stage       string
+	Result      string
+	UpstreamURL string
+	StartedAt   time.Time
+	DurationMS  int64
+	Diagnostic  DiagnosticResponse
+	Failure     error
+}
+
 // ReadDiagnosticBody reads up to the diagnostic body limit and reports whether upstream content was truncated.
 func ReadDiagnosticBody(body io.Reader) ([]byte, bool, error) {
 	if body == nil {
@@ -443,18 +469,22 @@ type DeviceAuthorization struct {
 
 // CredentialSeed represents an OAuth credential not yet persisted after login or import.
 type CredentialSeed struct {
-	Provider                account.Provider
-	AuthType                account.AuthType
-	WebTier                 account.WebTier
-	Name                    string
-	Email                   string
-	UserID                  string
-	TeamID                  string
-	SourceKey               string
-	OIDCClientID            string
-	AccessToken             string
-	RefreshToken            string
-	CloudflareCookies       string
+	Provider          account.Provider
+	AuthType          account.AuthType
+	WebTier           account.WebTier
+	Name              string
+	Email             string
+	UserID            string
+	TeamID            string
+	SourceKey         string
+	OIDCClientID      string
+	AccessToken       string
+	RefreshToken      string
+	CloudflareCookies string
+	// ConsoleAPIKeyID and ConsoleWorkOSSession (plaintext JSON of the WorkOS
+	// cookie triple) are optional grok_console caches supplied by imports.
+	ConsoleAPIKeyID         string
+	ConsoleWorkOSSession    string
 	ExpiresAt               time.Time
 	WebNSFWEnabledAt        *time.Time
 	WebTermsAcceptedAt      *time.Time

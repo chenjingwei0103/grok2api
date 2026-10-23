@@ -9,11 +9,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 const (
-	maxDeferredSearchTextBytes       = 8 << 20
-	maxDeferredReasoningSummaryBytes = 8 << 20
+	maxDeferredSearchTextBytes = 8 << 20
 
 	// contentDoomLoopThreshold 连续重复同一可见内容增量时终止流。真正的
 	// 内容循环会消耗配额和客户端上下文，因此远低于推理上限；但仍需容纳
@@ -52,36 +53,42 @@ func ConvertResponseStreamWithOptions(source io.ReadCloser, operation string, op
 }
 
 type streamConverter struct {
-	writer            io.Writer
-	operation         string
-	id                string
-	model             string
-	created           int64
-	started           bool
-	finished          bool
-	textStarted       bool
-	textIndex         int
-	thinkingStarted   bool
-	thinkingClosed    bool
-	thinkingIndex     int
-	thinkingItemID    string
-	chatReasoningMark bool
-	evidenceMarked    bool
-	reasoningItems    map[string]*reasoningStreamState
-	reasoningOrder    []string
-	activeReasoningID string
-	nextIndex         int
-	tools             map[string]streamTool
-	webSearch         []webSearchCall
-	webSearchEmitted  map[string]bool
-	deferSearchText   bool
-	pendingSearchText strings.Builder
-	usage             responseUsage
-	options           ResponseOptions
-	stopFilter        *anthropicStreamStopFilter
-	stopSequence      string
-	refused           bool
-	repeatTracker     streamRepeatTracker
+	writer                 io.Writer
+	operation              string
+	id                     string
+	model                  string
+	created                int64
+	started                bool
+	finished               bool
+	textStarted            bool
+	textIndex              int
+	thinkingStarted        bool
+	thinkingClosed         bool
+	thinkingIndex          int
+	thinkingItemID         string
+	chatReasoningMark      bool
+	nextIndex              int
+	tools                  map[string]streamTool
+	webSearch              []webSearchCall
+	webSearchEmitted       map[string]bool
+	deferSearchText        bool
+	pendingSearchText      strings.Builder
+	usage                  responseUsage
+	options                ResponseOptions
+	stopFilter             *anthropicStreamStopFilter
+	stopSequence           string
+	refused                bool
+	reasoningEvidenceBytes int
+	reasoningItems         map[string]*reasoningStreamState
+	reasoningOrder         []string
+	activeReasoningID      string
+	repeatTracker          streamRepeatTracker
+	// terminalEvent distinguishes a normal Responses terminal frame from a
+	// transport EOF. EOF is still converted to the legacy downstream terminator
+	// for compatibility, but it must not make a truncated tool turn replayable.
+	terminalEvent bool
+	outputItems   []responseItem
+	outputItemIDs map[string]struct{}
 }
 
 // streamRepeatTracker 在协议转换、缓冲和 stop filter 之前跟踪上游增量，
@@ -132,36 +139,38 @@ type streamTool struct {
 }
 
 type reasoningStreamState struct {
-	summary   strings.Builder
-	rawSeen   bool
-	done      bool
-	anonymous bool
+	chosen           string // "summary" or "raw"; first source wins
+	done             bool
+	anonymous        bool
+	signatureEmitted bool
 }
 
 func newStreamConverter(writer io.Writer, operation string, options ResponseOptions) *streamConverter {
 	return &streamConverter{
 		writer: writer, operation: operation, created: time.Now().Unix(), tools: make(map[string]streamTool),
 		webSearchEmitted: make(map[string]bool),
+		outputItemIDs:    make(map[string]struct{}),
 		reasoningItems:   make(map[string]*reasoningStreamState),
 		deferSearchText:  operation == OperationMessages && options.AnthropicWebSearch,
 		options:          options, stopFilter: newAnthropicStreamStopFilter(options.StopSequences),
 	}
 }
 
-// markReasoningEvidence preserves non-empty upstream encrypted_content for the
-// request-path quality scanner after protocol conversion. SSE clients ignore
-// comments, so Chat and Messages public event payloads remain unchanged.
-func (c *streamConverter) markReasoningEvidence() error {
-	if c.evidenceMarked {
+// markReasoningEvidence preserves the upstream encrypted_content byte length
+// for the request-path quality scanner after protocol conversion. SSE clients
+// ignore comments, so Chat and Messages public event payloads remain unchanged.
+func (c *streamConverter) markReasoningEvidence(encrypted string) error {
+	byteCount := len(strings.TrimSpace(encrypted))
+	if byteCount <= c.reasoningEvidenceBytes {
 		return nil
 	}
 	if err := c.start(); err != nil {
 		return err
 	}
-	if _, err := io.WriteString(c.writer, ": grok2api-reasoning-evidence\n\n"); err != nil {
+	if _, err := fmt.Fprintf(c.writer, ": grok2api-reasoning-evidence %d\n\n", byteCount); err != nil {
 		return err
 	}
-	c.evidenceMarked = true
+	c.reasoningEvidenceBytes = byteCount
 	return nil
 }
 
@@ -341,10 +350,16 @@ func (c *streamConverter) handle(event string, data []byte) error {
 			c.ensureReasoningState(item.ID)
 		}
 		if item.Type == "reasoning" && c.operation == OperationMessages && c.options.AnthropicThinking {
-			return c.thinkingStart(item.ID)
+			if err := c.thinkingStart(item.ID); err != nil {
+				return err
+			}
+			return c.emitEncrypted(item)
 		}
 		if item.Type == "reasoning" && item.ID != "" && c.operation == OperationChat {
-			return c.markChatReasoningStart()
+			if err := c.markChatReasoningStart(); err != nil {
+				return err
+			}
+			return c.emitEncrypted(item)
 		}
 		if item.Type == "web_search_call" && c.operation == OperationMessages && c.options.AnthropicWebSearch {
 			if call, ok := parseWebSearchCallItem(item); ok {
@@ -371,6 +386,7 @@ func (c *streamConverter) handle(event string, data []byte) error {
 	case "response.output_item.done":
 		var item responseItem
 		_ = json.Unmarshal(root["item"], &item)
+		c.recordOutputItem(item)
 		if item.Type == "function_call" {
 			return c.toolArgumentsDone(item.ID, item.Arguments)
 		}
@@ -380,10 +396,8 @@ func (c *streamConverter) handle(event string, data []byte) error {
 					return err
 				}
 			}
-			if strings.TrimSpace(item.Encrypted) != "" {
-				if err := c.markReasoningEvidence(); err != nil {
-					return err
-				}
+			if err := c.emitEncrypted(item); err != nil {
+				return err
 			}
 			return c.thinkingDone(item)
 		}
@@ -395,10 +409,15 @@ func (c *streamConverter) handle(event string, data []byte) error {
 	case "response.completed", "response.incomplete":
 		var response responseEnvelope
 		_ = json.Unmarshal(root["response"], &response)
+		// Some upstream streams omit output_item.done and put the complete
+		// reasoning/function_call objects only in the terminal envelope. Record
+		// those objects before done() commits the replay cache.
+		c.recordReplayOutput(response.Output)
+		response.Output = c.mergeOutputItems(response.Output)
 		c.setResponse(response)
 		for _, item := range response.Output {
-			if item.Type == "reasoning" && strings.TrimSpace(item.Encrypted) != "" {
-				if err := c.markReasoningEvidence(); err != nil {
+			if item.Type == "reasoning" {
+				if err := c.emitEncrypted(item); err != nil {
 					return err
 				}
 			}
@@ -415,11 +434,182 @@ func (c *streamConverter) handle(event string, data []byte) error {
 		if status == "" && typeName == "response.incomplete" {
 			status = "incomplete"
 		}
+		c.terminalEvent = true
 		return c.done(status)
 	case "error", "response.failed":
 		return c.streamError(data)
 	}
 	return nil
+}
+
+// recordOutputItem retains the authoritative item-done payload. In streamed
+// Responses, response.completed often contains usage/status only and an empty
+// output array, while encrypted reasoning is present solely in these events.
+func (c *streamConverter) recordOutputItem(item responseItem) {
+	if c == nil || (item.Type != "reasoning" && item.Type != "function_call") {
+		return
+	}
+	if c.outputItemIDs == nil {
+		c.outputItemIDs = make(map[string]struct{})
+	}
+	key := replayOutputKey(item)
+	if key != "" {
+		if _, exists := c.outputItemIDs[key]; exists {
+			for index := range c.outputItems {
+				if replayOutputKey(c.outputItems[index]) == key {
+					c.outputItems[index] = mergeResponseItem(c.outputItems[index], item)
+					return
+				}
+			}
+		}
+		c.outputItemIDs[key] = struct{}{}
+	}
+	c.outputItems = append(c.outputItems, cloneResponseItem(item))
+}
+
+func replayOutputKey(item responseItem) string {
+	if id := strings.TrimSpace(item.ID); id != "" {
+		return "id:" + id
+	}
+	if item.Type == "function_call" {
+		if callID := strings.TrimSpace(item.CallID); callID != "" {
+			return "call:" + normalizeReasoningCallID(callID)
+		}
+	}
+	if item.Type == "reasoning" {
+		if encrypted := strings.TrimSpace(item.Encrypted); encrypted != "" {
+			return "proof:" + encrypted
+		}
+	}
+	return ""
+}
+
+// recordReplayOutput merges the terminal envelope into the items observed in
+// output_item.done. The event stream carries the authoritative output order;
+// the terminal envelope is used to fill richer fields and append items that
+// were never announced as done.
+func (c *streamConverter) recordReplayOutput(output []responseItem) {
+	if c == nil || len(output) == 0 {
+		return
+	}
+	merged := make([]responseItem, 0, len(c.outputItems)+len(output))
+	if len(c.outputItems) == 0 {
+		for _, item := range output {
+			if item.Type == "reasoning" || item.Type == "function_call" {
+				merged = append(merged, cloneResponseItem(item))
+			}
+		}
+	} else {
+		terminal := make(map[string]responseItem, len(output))
+		for _, item := range output {
+			if item.Type == "reasoning" || item.Type == "function_call" {
+				if key := replayOutputKey(item); key != "" {
+					terminal[key] = item
+				}
+			}
+		}
+		seen := make(map[string]struct{}, len(c.outputItems)+len(output))
+		for _, item := range c.outputItems {
+			key := replayOutputKey(item)
+			if key != "" {
+				if update, ok := terminal[key]; ok {
+					item = mergeResponseItem(item, update)
+				}
+				seen[key] = struct{}{}
+			}
+			merged = append(merged, cloneResponseItem(item))
+		}
+		for _, item := range output {
+			if item.Type != "reasoning" && item.Type != "function_call" {
+				continue
+			}
+			key := replayOutputKey(item)
+			if key != "" {
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+			}
+			merged = append(merged, cloneResponseItem(item))
+		}
+	}
+	c.outputItems = merged
+	c.outputItemIDs = make(map[string]struct{}, len(merged))
+	for _, item := range merged {
+		if key := replayOutputKey(item); key != "" {
+			c.outputItemIDs[key] = struct{}{}
+		}
+	}
+}
+
+func (c *streamConverter) commitReasoningReplay() {
+	if c == nil || c.options.reasoningCache == nil || strings.TrimSpace(c.options.reasoningScope) == "" || len(c.outputItems) == 0 {
+		return
+	}
+	c.options.reasoningCache.RememberReasoningForEnvelope(c.options.reasoningScope, responseEnvelope{Output: c.outputItems})
+}
+
+func (c *streamConverter) mergeOutputItems(output []responseItem) []responseItem {
+	if len(c.outputItems) == 0 {
+		return output
+	}
+	if len(output) == 0 {
+		return append([]responseItem(nil), c.outputItems...)
+	}
+	merged := append([]responseItem(nil), output...)
+	for _, item := range c.outputItems {
+		found := false
+		if key := replayOutputKey(item); key != "" {
+			for index := range merged {
+				if replayOutputKey(merged[index]) == key {
+					merged[index] = mergeResponseItem(merged[index], item)
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			merged = append(merged, item)
+		}
+	}
+	return merged
+}
+
+func mergeResponseItem(base, update responseItem) responseItem {
+	if base.ID == "" {
+		base.ID = update.ID
+	}
+	if base.Type == "" {
+		base.Type = update.Type
+	}
+	if base.Status == "" {
+		base.Status = update.Status
+	}
+	if base.Role == "" {
+		base.Role = update.Role
+	}
+	if base.CallID == "" {
+		base.CallID = update.CallID
+	}
+	if base.Name == "" {
+		base.Name = update.Name
+	}
+	if base.Arguments == "" {
+		base.Arguments = update.Arguments
+	}
+	if base.Encrypted == "" {
+		base.Encrypted = update.Encrypted
+	}
+	if len(base.Content) == 0 {
+		base.Content = update.Content
+	}
+	if len(base.Summary) == 0 {
+		base.Summary = update.Summary
+	}
+	if base.Action == nil {
+		base.Action = update.Action
+	}
+	return base
 }
 
 func (c *streamConverter) reasoningOutputEnabled() bool {
@@ -435,7 +625,7 @@ func (c *streamConverter) ensureReasoningState(itemID string) (string, *reasonin
 		}
 		// Some compatible upstreams omit item_id on the first delta. Once the
 		// real item arrives, attach that anonymous state instead of creating a
-		// second source that could later replay the buffered summary.
+		// second source that could later replay the first-wins choice.
 		if anonymous := c.activeReasoningID; anonymous != "" {
 			if state := c.reasoningItems[anonymous]; state != nil && state.anonymous && !state.done {
 				delete(c.reasoningItems, anonymous)
@@ -471,25 +661,16 @@ func (c *streamConverter) ensureReasoningState(itemID string) (string, *reasonin
 }
 
 func (c *streamConverter) reasoningSummaryDelta(itemID, delta string) error {
-	if delta == "" || !c.reasoningOutputEnabled() {
-		return nil
-	}
-	_, state := c.ensureReasoningState(itemID)
-	if state.done || state.rawSeen {
-		return nil
-	}
-	// Console can publish the same client-facing thought through summary and
-	// raw reasoning events. Defer summary until item completion so raw can take
-	// precedence without relying on chunk boundaries or text equality.
-	pending := state.summary.Len()
-	if pending >= maxDeferredReasoningSummaryBytes || len(delta) > maxDeferredReasoningSummaryBytes-pending {
-		return fmt.Errorf("reasoning summary 延迟缓冲超过 %d MiB", maxDeferredReasoningSummaryBytes>>20)
-	}
-	state.summary.WriteString(delta)
-	return nil
+	return c.reasoningLiveDelta(itemID, delta, "summary")
 }
 
 func (c *streamConverter) reasoningTextDelta(itemID, delta string) error {
+	return c.reasoningLiveDelta(itemID, delta, "raw")
+}
+
+// reasoningLiveDelta emits the first reasoning source in real time and drops
+// the other. Build currently streams summary only; Console may also send raw.
+func (c *streamConverter) reasoningLiveDelta(itemID, delta, source string) error {
 	if delta == "" || !c.reasoningOutputEnabled() {
 		return nil
 	}
@@ -497,9 +678,11 @@ func (c *streamConverter) reasoningTextDelta(itemID, delta string) error {
 	if state.done {
 		return nil
 	}
-	if !state.rawSeen {
-		state.rawSeen = true
-		state.summary.Reset()
+	if state.chosen == "" {
+		state.chosen = source
+	}
+	if state.chosen != source {
+		return nil
 	}
 	return c.emitReasoningDelta(delta)
 }
@@ -514,13 +697,42 @@ func (c *streamConverter) emitReasoningDelta(delta string) error {
 	return nil
 }
 
+func (c *streamConverter) emitEncrypted(item responseItem) error {
+	if strings.TrimSpace(item.Encrypted) == "" {
+		return nil
+	}
+	// Record richer late payloads for the quality scanner even after the public
+	// signature delta has already been emitted for this reasoning item.
+	if err := c.markReasoningEvidence(item.Encrypted); err != nil {
+		return err
+	}
+	if c.operation != OperationMessages || !c.options.AnthropicThinking {
+		return nil
+	}
+	_, state := c.ensureReasoningState(item.ID)
+	if state.signatureEmitted {
+		return nil
+	}
+	if err := c.thinkingStart(item.ID); err != nil {
+		return err
+	}
+	if c.thinkingClosed {
+		return nil
+	}
+	if err := c.writeEvent("content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": c.thinkingIndex,
+		"delta": map[string]any{"type": "signature_delta", "signature": item.Encrypted},
+	}); err != nil {
+		return err
+	}
+	state.signatureEmitted = true
+	return nil
+}
+
 func (c *streamConverter) reasoningDone(item responseItem) error {
 	key, state := c.ensureReasoningState(item.ID)
 	if state.done {
 		return nil
-	}
-	if err := c.flushReasoningSummary(state); err != nil {
-		return err
 	}
 	state.done = true
 	if c.activeReasoningID == key {
@@ -529,23 +741,11 @@ func (c *streamConverter) reasoningDone(item responseItem) error {
 	return nil
 }
 
-func (c *streamConverter) flushReasoningSummary(state *reasoningStreamState) error {
-	if state == nil || state.rawSeen || state.summary.Len() == 0 {
-		return nil
-	}
-	value := state.summary.String()
-	state.summary.Reset()
-	return c.emitReasoningDelta(value)
-}
-
 func (c *streamConverter) flushPendingReasoning() error {
 	for _, key := range c.reasoningOrder {
 		state := c.reasoningItems[key]
 		if state.done {
 			continue
-		}
-		if err := c.flushReasoningSummary(state); err != nil {
-			return err
 		}
 		state.done = true
 	}
@@ -658,13 +858,23 @@ func (c *streamConverter) done(status string) error {
 	if err := c.start(); err != nil {
 		return err
 	}
+	var err error
 	if err := c.flushPendingReasoning(); err != nil {
 		return err
 	}
 	if c.operation == OperationChat {
-		return c.doneChat(status)
+		err = c.doneChat(status)
+	} else {
+		err = c.doneMessages(status)
 	}
-	return c.doneMessages(status)
+	if err == nil && c.terminalEvent {
+		// Commit only after the downstream terminal event was written. If the
+		// upstream failed, the client abandoned the pipe, or the source ended
+		// without a terminal Responses event, a partially observed tool turn must
+		// not become replayable state.
+		c.commitReasoningReplay()
+	}
+	return err
 }
 
 func (c *streamConverter) streamError(data []byte) error {
@@ -803,7 +1013,7 @@ func (t *streamRepeatTracker) trackContent(delta string) error {
 	}
 	t.contentRepeatCount++
 	if t.contentRepeatCount > contentDoomLoopThreshold {
-		return fmt.Errorf("model output loop detected (repeated content delta %d times)", t.contentRepeatCount)
+		return fmt.Errorf("%w (repeated content delta %d times)", neterror.ErrUpstreamOutputLoop, t.contentRepeatCount)
 	}
 	return nil
 }
@@ -819,7 +1029,7 @@ func (t *streamRepeatTracker) trackReasoning(delta, message string) error {
 	}
 	t.reasonRepeatCount++
 	if t.reasonRepeatCount > reasoningDoomLoopThreshold {
-		return fmt.Errorf("%s (repeated delta %d times)", message, t.reasonRepeatCount)
+		return fmt.Errorf("%w: %s (repeated delta %d times)", neterror.ErrUpstreamOutputLoop, message, t.reasonRepeatCount)
 	}
 	return nil
 }

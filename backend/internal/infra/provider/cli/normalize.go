@@ -203,10 +203,11 @@ func applyBuildResponseDefaults(payload map[string]json.RawMessage) (bool, error
 }
 
 // normalizeBuildReasoningEffortPayload maps client aliases to levels accepted by
-// the selected Grok model. Grok 4.5 and unknown models retain the proven defensive
-// xhigh/max -> high behavior for models without an xhigh wire contract. Models
-// that explicitly support xhigh keep xhigh and map the client-only max alias to
-// that highest verified upstream level.
+// the selected Grok model. grok-build treats minimal/xhigh/max as distinct wire
+// tiers, so a tier the model's catalog menu lists is forwarded verbatim. Only
+// tiers the model does not offer are folded onto the nearest offered level:
+// minimal -> low, max -> xhigh -> high. Grok 4.5 and unknown models therefore
+// retain the proven defensive xhigh/max -> high behavior.
 func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, model string) bool {
 	raw, exists := payload["reasoning"]
 	if !exists || isEmptyJSON(raw) {
@@ -235,22 +236,15 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	if err := json.Unmarshal(reasoning["effort"], &effort); err != nil {
 		return false
 	}
+	requested := strings.ToLower(strings.TrimSpace(effort))
 	var normalized string
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal":
-		normalized = modeldomain.ReasoningEffortLow
-	case "xhigh":
-		if modeldomain.SupportsReasoningEffort(model, modeldomain.ReasoningEffortXHigh) {
-			normalized = modeldomain.ReasoningEffortXHigh
-		} else {
-			normalized = modeldomain.ReasoningEffortHigh
-		}
-	case "max":
-		if modeldomain.SupportsReasoningEffort(model, modeldomain.ReasoningEffortXHigh) {
-			normalized = modeldomain.ReasoningEffortXHigh
-		} else {
-			normalized = modeldomain.ReasoningEffortHigh
-		}
+	switch requested {
+	case modeldomain.ReasoningEffortMinimal:
+		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortMinimal, modeldomain.ReasoningEffortLow)
+	case modeldomain.ReasoningEffortXHigh:
+		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortHigh)
+	case modeldomain.ReasoningEffortMax:
+		normalized = foldBuildReasoningEffort(model, modeldomain.ReasoningEffortMax, modeldomain.ReasoningEffortXHigh, modeldomain.ReasoningEffortHigh)
 	default:
 		return false
 	}
@@ -260,6 +254,18 @@ func normalizeBuildReasoningEffortPayload(payload map[string]json.RawMessage, mo
 	reasoning["effort"] = mustJSON(normalized)
 	payload["reasoning"] = mustJSON(reasoning)
 	return true
+}
+
+// foldBuildReasoningEffort returns the first candidate tier the model offers,
+// falling back to the last candidate when none is offered. Candidates are
+// ordered from the requested tier down to the proven safe level.
+func foldBuildReasoningEffort(model string, candidates ...string) string {
+	for _, candidate := range candidates {
+		if modeldomain.SupportsReasoningEffort(model, candidate) {
+			return candidate
+		}
+	}
+	return candidates[len(candidates)-1]
 }
 
 // patchReasoningTextTypes 对齐官方 CLI 的序列化后修补：Responses 上游要求

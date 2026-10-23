@@ -27,6 +27,7 @@ import { cn } from "@/shared/lib/cn";
 import { formatCompactDateTime, formatDateTime, formatDuration, formatNumber } from "@/shared/lib/format";
 import { toPeriodValue, type PeriodDays } from "@/shared/lib/period";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
+import { formatUSDTicks, usdTicksToValue } from "@/shared/lib/usd";
 
 const AUDIT_PAGE_CACHE_TIME_MS = 60_000;
 const AUDIT_SUMMARY_CACHE_TIME_MS = 120_000;
@@ -200,8 +201,8 @@ export function RequestAuditsPage() {
             icon={CircleDollarSign}
             loading={summaryLoading}
             label={t("audits.estimatedCost")}
-            value={hasEstimatedCost ? formatUSDCost(estimatedCostTicks, 2) : "-"}
-            fullValue={hasEstimatedCost ? formatUSDCost(estimatedCostTicks, 10) : undefined}
+            value={hasEstimatedCost ? formatUSDTicks(estimatedCostTicks, 2) : "-"}
+            fullValue={hasEstimatedCost ? formatUSDTicks(estimatedCostTicks, 10) : undefined}
             detail={t("audits.pricingCoverage", { priced: formatNumber(summary?.pricing.pricedRequests ?? 0, i18n.language, 0), unpriced: formatNumber(summary?.pricing.unpricedRequests ?? 0, i18n.language, 0) })}
             tooltip={t("audits.pricingDescription")}
           />
@@ -403,7 +404,7 @@ function EgressValue({ audit }: { audit: AuditDTO }) {
 function BillingValue({ audit }: { audit: AuditDTO }) {
   const { t, i18n } = useTranslation();
   const billing = audit.billing ?? fallbackBillingBreakdown(audit);
-  const amount = billing ? formatUSDCost(billing.totalInUsdTicks, 2) : t("audits.unbilled");
+  const amount = billing ? formatUSDTicks(billing.totalInUsdTicks, 2) : t("audits.unbilled");
   return (
     <div className="max-w-full text-left">
       {billing ? (
@@ -466,7 +467,7 @@ function BillingBreakdown({ billing, locale }: { billing: AuditBillingBreakdownD
       </div>
       <div className="flex items-baseline justify-between gap-4 border-t border-primary-foreground/15 pt-2 font-medium">
         <span>{t("audits.billingConclusion")}</span>
-        <span className="font-mono tabular-nums">{formatUSDCost(billing.totalInUsdTicks, 10)}</span>
+        <span className="font-mono tabular-nums">{formatUSDTicks(billing.totalInUsdTicks, 10)}</span>
       </div>
     </div>
   );
@@ -490,7 +491,7 @@ function BillingFormula({ component, locale }: { component: AuditBillingComponen
   return (
     <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3">
       <span className="text-primary-foreground/65">{t(`audits.billingComponents.${component.kind}`)}</span>
-      <span className="break-words text-right font-mono tabular-nums">{formula} = {formatUSDCost(component.subtotalInUsdTicks, 10)}</span>
+      <span className="break-words text-right font-mono tabular-nums">{formula} = {formatUSDTicks(component.subtotalInUsdTicks, 10)}</span>
     </div>
   );
 }
@@ -669,10 +670,12 @@ function UsageMetric({ label, value, reasoningEffort }: {
 function reasoningEffortTone(effort: NonNullable<AuditDTO["reasoningEffort"]>): string {
   switch (effort) {
     case "none": return "text-muted-foreground";
+    case "minimal": return "text-teal-600 dark:text-teal-400";
     case "low": return "text-sky-600 dark:text-sky-400";
     case "medium": return "text-amber-600 dark:text-amber-400";
     case "high": return "text-orange-600 dark:text-orange-400";
     case "xhigh": return "text-rose-600 dark:text-rose-400";
+    case "max": return "text-fuchsia-600 dark:text-fuchsia-400";
     case "auto": return "text-violet-600 dark:text-violet-400";
     case "fixed": return "text-indigo-600 dark:text-indigo-400";
   }
@@ -778,11 +781,7 @@ function auditFilterOptionSearch(value: string): string {
   return /^\d+$/.test(trimmed) ? `#${trimmed}` : trimmed;
 }
 
-function formatUSDCost(ticks: number, fractionDigits: number): string {
-  return `$${(ticks / 10_000_000_000).toFixed(fractionDigits)}`;
-}
-
 function formatUSDCostCompact(ticks: number): string {
-  const value = (ticks / 10_000_000_000).toFixed(10).replace(/0+$/, "").replace(/\.$/, "");
+  const value = usdTicksToValue(ticks).toFixed(10).replace(/0+$/, "").replace(/\.$/, "");
   return `$${value}`;
 }

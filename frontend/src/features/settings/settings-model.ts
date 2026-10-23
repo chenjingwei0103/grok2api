@@ -89,6 +89,7 @@ export const settingsSchema = z.object({
     clearanceRefresh: durationSchema.refine((value) => durationSeconds(value) >= 60 && durationSeconds(value) <= 86_400),
     quotaTimeout: durationSchema, chatTimeout: durationSchema, streamIdleTimeout: providerStreamIdleDuration, imageTimeout: durationSchema, videoTimeout: durationSchema,
     mediaConcurrency: positiveInteger.max(64), allowNSFW: z.boolean(),
+    freeVideoDurationCap: z.number().int().min(1).max(15),
     recoveryBackoffBase: durationSchema, recoveryBackoffMax: durationSchema,
   }).superRefine((value, context) => {
     if (durationSeconds(value.streamIdleTimeout) > durationSeconds(value.chatTimeout)) {
@@ -162,6 +163,7 @@ export const settingsSchema = z.object({
     .refine((value) => value.batchSize <= value.bufferSize, { path: ["batchSize"] }),
   clientKeyDefaults: z.object({ rpmLimit: positiveInteger.max(100_000), maxConcurrent: positiveInteger.max(1_024) }),
   accounts: z.object({
+    autoDisableDegradedAccounts: z.boolean(),
     markBuildForbiddenReauth: z.boolean(),
     buildForbiddenReauthCodes: z.string().superRefine((value, context) => {
       const codes = parseForbiddenCodes(value);
@@ -170,6 +172,7 @@ export const settingsSchema = z.object({
       }
     }),
     excludeBuildBotFlaggedFromScheduling: z.boolean(),
+    autoDeleteConsoleUnlinked: z.boolean(),
     autoCleanReauthEnabled: z.boolean(),
     autoCleanReauthInterval: durationSchema.refine((value) => {
       const seconds = durationSeconds(value);
@@ -195,6 +198,7 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       clearanceTimeout: parseDuration(config.providerWeb.clearanceTimeout), clearanceRefresh: parseDuration(config.providerWeb.clearanceRefresh),
       quotaTimeout: parseDuration(config.providerWeb.quotaTimeout), chatTimeout: parseDuration(config.providerWeb.chatTimeout), streamIdleTimeout: parseDuration(config.providerWeb.streamIdleTimeout),
       imageTimeout: parseDuration(config.providerWeb.imageTimeout), videoTimeout: parseDuration(config.providerWeb.videoTimeout),
+      freeVideoDurationCap: config.providerWeb.freeVideoDurationCap || 6,
       recoveryBackoffBase: parseDuration(config.providerWeb.recoveryBackoffBase), recoveryBackoffMax: parseDuration(config.providerWeb.recoveryBackoffMax),
     },
     providerConsole: { ...config.providerConsole, chatTimeout: parseDuration(config.providerConsole.chatTimeout), streamIdleTimeout: parseDuration(config.providerConsole.streamIdleTimeout) },
@@ -224,9 +228,11 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
     },
     clientKeyDefaults: config.clientKeyDefaults,
     accounts: {
+      autoDisableDegradedAccounts: config.accounts.autoDisableDegradedAccounts,
       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
       buildForbiddenReauthCodes: config.accounts.buildForbiddenReauthCodes.join("\n"),
       excludeBuildBotFlaggedFromScheduling: config.accounts.excludeBuildBotFlaggedFromScheduling,
+      autoDeleteConsoleUnlinked: config.accounts.autoDeleteConsoleUnlinked,
       autoCleanReauthEnabled: config.accounts.autoCleanReauthEnabled,
       autoCleanReauthInterval: parseDuration(config.accounts.autoCleanReauthInterval),
       autoCleanReauthMinAge: parseDuration(config.accounts.autoCleanReauthMinAge),
@@ -273,9 +279,11 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
     },
     clientKeyDefaults: config.clientKeyDefaults,
     accounts: {
+      autoDisableDegradedAccounts: config.accounts.autoDisableDegradedAccounts,
       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
       buildForbiddenReauthCodes: parseForbiddenCodes(config.accounts.buildForbiddenReauthCodes),
       excludeBuildBotFlaggedFromScheduling: config.accounts.excludeBuildBotFlaggedFromScheduling,
+      autoDeleteConsoleUnlinked: config.accounts.autoDeleteConsoleUnlinked,
       autoCleanReauthEnabled: config.accounts.autoCleanReauthEnabled,
       autoCleanReauthInterval: formatDuration(config.accounts.autoCleanReauthInterval),
       autoCleanReauthMinAge: formatDuration(config.accounts.autoCleanReauthMinAge),

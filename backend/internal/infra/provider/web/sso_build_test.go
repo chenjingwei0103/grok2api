@@ -2,12 +2,15 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -69,18 +72,18 @@ func TestSSOBuildFlowMapsDeadSSOToUnauthorized(t *testing.T) {
 	}
 }
 
-func TestSSOBuildFlowUsesConsentToken(t *testing.T) {
-	consent := `<form action="https://auth.x.ai/oauth2/device/approve" method="POST"><input type="hidden" name="user_code" value="uc"/><input type="hidden" name="principal_type" value="User"/><input type="hidden" name="principal_id" value=""/><input type="hidden" name="consent_token" value="consent-secret"/></form>`
+func TestSSOBuildFlowConvertsEndToEndWithConsentToken(t *testing.T) {
 	client := &scriptedSSOClient{responses: []*http.Response{
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
 			`{"device_code":"dc","user_code":"uc","interval":1,"expires_in":1800}`))},
 		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent"}}, Body: io.NopCloser(strings.NewReader(""))},
-		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(consent))},
-		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://auth.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`<form method="post"><input value="eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig" type="hidden" name="consent_token"></form>`))},
+		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
 			`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`))},
 	}}
-	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "live", "sso-rw": "live"}}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: ssoBuildCookies("live", "cf_clearance=clearance")}
 	seed, err := flow.convert(context.Background(), fakeCredential())
 	if err != nil {
 		t.Fatal(err)
@@ -88,25 +91,59 @@ func TestSSOBuildFlowUsesConsentToken(t *testing.T) {
 	if seed.AccessToken != "access" || seed.RefreshToken != "refresh" || len(client.requests) != 5 {
 		t.Fatalf("seed=%#v requests=%d", seed, len(client.requests))
 	}
-	if client.requests[2].URL.Host != "accounts.x.ai" || client.requests[2].Method != http.MethodGet {
-		t.Fatalf("consent request = %s %s", client.requests[2].Method, client.requests[2].URL)
+	hosts := []string{"auth.x.ai", "auth.x.ai", "accounts.x.ai", "auth.x.ai", "auth.x.ai"}
+	for index, request := range client.requests {
+		if request.URL.Hostname() != hosts[index] {
+			t.Fatalf("device flow visited unexpected host %q", request.URL.Hostname())
+		}
+	}
+	if client.requests[3].URL.RawQuery != "" {
+		t.Fatalf("approve must post a form body, got query %q", client.requests[3].URL.RawQuery)
 	}
 	approve := client.requests[3]
-	if approve.URL.Host != "auth.x.ai" || approve.Header.Get("Origin") != "https://accounts.x.ai" {
-		t.Fatalf("approve = %s origin %q", approve.URL, approve.Header.Get("Origin"))
+	if approve.Method != http.MethodPost {
+		t.Fatalf("approve method = %q, want POST", approve.Method)
 	}
-	body, _ := io.ReadAll(approve.Body)
-	if !strings.Contains(string(body), "consent_token=consent-secret") {
-		t.Fatalf("approve body = %q", body)
+	wantHeaders := map[string]string{
+		"Origin":                    "https://accounts.x.ai",
+		"Referer":                   "https://accounts.x.ai/oauth2/device/consent",
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "same-site",
+		"Sec-Fetch-User":            "?1",
+		"Upgrade-Insecure-Requests": "1",
+	}
+	for name, want := range wantHeaders {
+		if got := approve.Header.Get(name); got != want {
+			t.Errorf("approve %s = %q, want %q", name, got, want)
+		}
+	}
+	consentCookie := client.requests[2].Header.Get("Cookie")
+	if !strings.Contains(consentCookie, "sso=live") || !strings.Contains(consentCookie, "cf_clearance=clearance") {
+		t.Fatalf("consent request cookies = %q", consentCookie)
+	}
+	if client.requests[2].Header.Get("Sec-Fetch-Mode") != "navigate" || client.requests[2].Header.Get("Sec-Fetch-Dest") != "document" {
+		t.Fatalf("consent request is missing navigation headers: %#v", client.requests[2].Header)
+	}
+	body, err := io.ReadAll(client.requests[3].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approveForm, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approveForm.Get("consent_token") != "eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig" {
+		t.Fatalf("approve form missing consent_token: %q", approveForm.Get("consent_token"))
 	}
 }
 
 func TestSSOBuildFlowVerifyDoesNotFollowRedirect(t *testing.T) {
 	client := &scriptedSSOClient{responses: []*http.Response{
-		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent"}}, Body: io.NopCloser(strings.NewReader("verify response"))},
 	}}
 	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "live"}}
-	status, finalURL, _, err := flow.doWithFollow(context.Background(), http.MethodPost, ssoVerifyURL, url.Values{"user_code": {"uc"}}, false)
+	status, finalURL, body, err := flow.doWithFollow(context.Background(), http.MethodPost, ssoVerifyURL, url.Values{"user_code": {"uc"}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +155,9 @@ func TestSSOBuildFlowVerifyDoesNotFollowRedirect(t *testing.T) {
 	}
 	if len(client.requests) != 1 {
 		t.Fatalf("redirect must not be followed, requests = %d", len(client.requests))
+	}
+	if string(body) != "verify response" {
+		t.Fatalf("redirect response body = %q", body)
 	}
 }
 
@@ -139,6 +179,47 @@ func TestSSODeviceRedirectStateRequiresExactTrustedPath(t *testing.T) {
 
 func fakeCredential() accountdomain.Credential { return accountdomain.Credential{} }
 
+func TestExtractConsentToken(t *testing.T) {
+	form := []byte(`<input value="eyJhbGciOiJFUzI1NiJ9.a.b" type="hidden" name="consent_token">`)
+	if token := extractConsentToken(form); token != "eyJhbGciOiJFUzI1NiJ9.a.b" {
+		t.Fatalf("form token = %q", token)
+	}
+	jsonPayload := []byte(`{"consentToken":"eyJhbGciOiJFUzI1NiJ9.c.d","other":1}`)
+	if token := extractConsentToken(jsonPayload); token != "eyJhbGciOiJFUzI1NiJ9.c.d" {
+		t.Fatalf("json token = %q", token)
+	}
+	rscPayload := []byte(`{\"consentToken\":\"eyJhbGciOiJFUzI1NiJ9.e.f\"}`)
+	if token := extractConsentToken(rscPayload); token != "eyJhbGciOiJFUzI1NiJ9.e.f" {
+		t.Fatalf("escaped RSC token = %q", token)
+	}
+	if token := extractConsentToken([]byte("<html>nothing</html>")); token != "" {
+		t.Fatalf("unexpected token = %q", token)
+	}
+}
+
+func TestConsentTokenMustMatchDeviceCode(t *testing.T) {
+	token := "eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig"
+	if !consentTokenMatchesDevice(token, "dc") {
+		t.Fatal("consent token for current device code was rejected")
+	}
+	if consentTokenMatchesDevice(token, "other-device") {
+		t.Fatal("consent token for a different device code was accepted")
+	}
+	if consentTokenMatchesDevice("not-a-jwt", "dc") {
+		t.Fatal("malformed consent token was accepted")
+	}
+}
+
+func TestSSOBuildCookiesCarrySanitizedCloudflareClearance(t *testing.T) {
+	cookies := ssoBuildCookies("sso-token", "cf_clearance=clearance; __cf_bm=bm; sso=attacker")
+	if cookies["sso"] != "sso-token" || cookies["sso-rw"] != "sso-token" {
+		t.Fatalf("SSO cookies = %#v", cookies)
+	}
+	if cookies["cf_clearance"] != "clearance" || cookies["__cf_bm"] != "bm" {
+		t.Fatalf("Cloudflare cookies = %#v", cookies)
+	}
+}
+
 func TestSSOBuildConversionSanitizesTokenAndURLs(t *testing.T) {
 	if token := normalizeSSOToken("sso=token-value; x-userid=drop"); token != "token-value" {
 		t.Fatalf("token = %q", token)
@@ -152,5 +233,42 @@ func TestSSOBuildConversionSanitizesTokenAndURLs(t *testing.T) {
 		if safeXAIURL(value) {
 			t.Fatalf("unsafe URL accepted: %s", value)
 		}
+	}
+}
+
+// TestConsentTokenBoundByUserCode mirrors the live consent page (2026-10-20):
+// self-closing hidden inputs and a dc claim that is a server-side UUID.
+func TestConsentTokenBoundByUserCode(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"consent+jwt","alg":"ES256","kid":"k"}`))
+	exp := time.Now().Add(5 * time.Minute).Unix()
+	claims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"dc":"0b7c6f0e-1111-4222-8333-444455556666","aud":"consent","exp":%d}`, exp)))
+	token := header + "." + claims + ".sig"
+	page := []byte(`<form><input type="hidden" name="user_code" value="5C3A-S5Y7"/><input type="hidden" name="principal_type" value="User"/><input type="hidden" name="consent_token" value="` + token + `"/></form>`)
+	if got := extractConsentToken(page); got != token {
+		t.Fatalf("self-closing consent_token = %q", got)
+	}
+	pageUserCode := extractConsentInput(page, "user_code")
+	if !consentTokenMatchesUserCode(token, pageUserCode, "5C3A-S5Y7", time.Now()) {
+		t.Fatal("consent token bound to our user_code was rejected")
+	}
+	if consentTokenMatchesUserCode(token, pageUserCode, "ZZZZ-ZZZZ", time.Now()) {
+		t.Fatal("consent page for another user_code was accepted")
+	}
+	if consentTokenMatchesUserCode(token, pageUserCode, "5C3A-S5Y7", time.Now().Add(time.Hour)) {
+		t.Fatal("expired consent token was accepted")
+	}
+	plain := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"JWT","alg":"ES256"}`)) + "." + claims + ".sig"
+	if consentTokenMatchesUserCode(plain, pageUserCode, "5C3A-S5Y7", time.Now()) {
+		t.Fatal("non-consent JWT was accepted")
+	}
+}
+
+func TestBrowserVerificationRequiredBody(t *testing.T) {
+	live := []byte(`<h1>Request could not be verified</h1><p>We could not verify this browser. Allow scripts and turn off ad or tracker blockers for this site, then enter the code again.</p>`)
+	if !isBrowserVerificationRequired(live) {
+		t.Fatal("live Castle rejection not recognized")
+	}
+	if isBrowserVerificationRequired([]byte(`{"error":"access_denied"}`)) {
+		t.Fatal("ordinary 403 misclassified as browser verification")
 	}
 }

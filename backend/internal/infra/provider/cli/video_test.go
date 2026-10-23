@@ -548,7 +548,7 @@ func TestGenerateVideoFailedStatusAndDownloadTrustedURL(t *testing.T) {
 		for _, key := range []string{
 			"Authorization", "X-XAI-Token-Auth", "x-userid",
 			"x-grok-model-override", "x-grok-session-id", "x-grok-agent-id",
-			"x-grok-conv-id", "x-grok-req-id", "x-grok-conversation-id",
+			"x-grok-conv-id", "x-grok-conv-group-id", "x-grok-req-id", "x-grok-conversation-id",
 			"x-grok-session-id-legacy", "x-grok-request-id",
 			"x-grok-client-version", "x-grok-client-identifier",
 		} {

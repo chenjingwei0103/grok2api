@@ -127,6 +127,11 @@ func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 			requestScopedForbidden: true, upstreamCode: "invalid-argument",
 		},
 		{
+			name: "400 tool schema union", status: http.StatusBadRequest,
+			body:                   `{"code":"invalid-argument","error":"mcp__codex_app__automation_update: tool parameter root must be an object type (root schema is an anyOf/oneOf union with a non-object branch)"}`,
+			requestScopedForbidden: true, upstreamCode: "invalid-argument",
+		},
+		{
 			name: "request-level access denied sentence", body: `{"code":"operation-denied","error":"Access denied because this operation is unavailable under ZDR"}`,
 			requestScopedForbidden: true, upstreamCode: "operation-denied",
 		},
@@ -157,6 +162,24 @@ func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 				t.Fatalf("public=%q audit=%q", failure.ClientCredentialErrorCode(), failure.AuditCode())
 			}
 		})
+	}
+}
+
+func TestClassifyUpstreamHTTPErrorInvalidArgument(t *testing.T) {
+	code, message := ClassifyUpstreamHTTPError(http.StatusBadRequest, []byte(`{"code":"invalid-argument","error":"mcp__codex_app__automation_update: tool parameter root must be an object type (root schema is an anyOf/oneOf union with a non-object branch)"}`))
+	if code != "invalid_argument" || !strings.Contains(message, "mcp__codex_app__automation_update") {
+		t.Fatalf("code=%q message=%q", code, message)
+	}
+	failure := newHTTPUpstreamFailure(http.StatusBadRequest, []byte(`{"code":"invalid-argument","error":"mcp__codex_app__automation_update: tool parameter root must be an object type"}`), 42, "build")
+	if !failure.RequestScopedForbidden || failure.AccountScoped || failure.Code != "invalid_argument" {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
+func TestClassifyUpstreamHTTPErrorKeepsOther4xxMessage(t *testing.T) {
+	code, message := ClassifyUpstreamHTTPError(http.StatusNotFound, []byte(`{"error":{"code":"not_found","message":"requested response is missing"}}`))
+	if code != "upstream_error" || message != "requested response is missing" {
+		t.Fatalf("code=%q message=%q", code, message)
 	}
 }
 
@@ -240,6 +263,52 @@ func TestHTTPUpstreamFailureLeavesPaymentRecoveryKindToBilling(t *testing.T) {
 	}`), 42, "build")
 	if !failure.AccountScoped || !failure.QuotaExhausted || failure.FreeQuotaExhausted || failure.UpstreamCode != "personal-team-blocked:spending-limit" {
 		t.Fatalf("failure = %#v", failure)
+	}
+}
+
+func TestRetryableResponseRotatesOnlyOnInternalBuildReasoningRecoveryFailure(t *testing.T) {
+	failedHeader := make(http.Header)
+	failedHeader.Set("X-Grok2API-Compatibility-Warnings", "reasoning_encrypted_content_downgraded,reasoning_recovery_failed")
+	failed := &provider.Response{
+		StatusCode:              http.StatusBadRequest,
+		Header:                  failedHeader,
+		Body:                    io.NopCloser(strings.NewReader(`{"error":"Could not decode the compaction blob"}`)),
+		ReasoningRecoveryFailed: true,
+	}
+	if !isRetryableResponse(failed, accountdomain.ProviderBuild) {
+		t.Fatal("reasoning_recovery_failed 400 must rotate accounts")
+	}
+	if isRetryableResponse(failed, accountdomain.ProviderWeb) {
+		t.Fatal("reasoning recovery failover must remain Build-specific")
+	}
+
+	spoofed := &provider.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     failedHeader,
+		Body:       io.NopCloser(strings.NewReader(`{"error":"unrelated bad request"}`)),
+	}
+	if isRetryableResponse(spoofed, accountdomain.ProviderBuild) {
+		t.Fatal("an upstream-controlled compatibility warning must not trigger account rotation")
+	}
+
+	plain := &provider.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"error":"Could not decode the compaction blob"}`)),
+		Diagnostic: &provider.DiagnosticResponse{Body: []byte(`{"error":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}`)},
+	}
+	if isRetryableResponse(plain, accountdomain.ProviderBuild) {
+		t.Fatal("plain compaction 400 must not rotate accounts without reasoning_recovery_failed")
+	}
+
+	unrelated := &provider.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"error":"invalid request history"}`)),
+		Diagnostic: &provider.DiagnosticResponse{Body: []byte(`{"error":"could not decode request json"}`)},
+	}
+	if isRetryableResponse(unrelated, accountdomain.ProviderBuild) {
+		t.Fatal("unrelated 400 must not match encrypted_content/decode substrings")
 	}
 }
 
@@ -386,5 +455,19 @@ func TestTerminalRequestForbiddenRequiresExplicitRequestSignal(t *testing.T) {
 		if !isTerminalRequestForbidden(providerValue, safety) {
 			t.Fatalf("%s safety rejection must remain terminal", providerValue)
 		}
+	}
+}
+
+func TestHTTPUpstreamFailureClassifiesConsoleNoCredits(t *testing.T) {
+	failure := newHTTPUpstreamFailure(http.StatusForbidden, []byte(`{"code":"The caller does not have permission to execute the specified operation","error":"permission-denied: no credits or licenses yet"}`), 1, "console")
+	if !failure.NoCreditsOrLicenses || !failure.AccountScoped || failure.AccountBlocked || failure.RequestScopedForbidden {
+		t.Fatalf("failure = %#v", failure)
+	}
+	if !isConsoleNoCreditsFailure(accountdomain.ProviderConsole, failure) || isConsoleNoCreditsFailure(accountdomain.ProviderBuild, failure) {
+		t.Fatal("no-credits retirement must be Console-only")
+	}
+	spending := newHTTPUpstreamFailure(http.StatusPaymentRequired, []byte(`{"code":"personal-team-blocked:spending-limit","error":"spending limit reached"}`), 1, "console")
+	if spending.NoCreditsOrLicenses || !spending.QuotaExhausted || !spending.SpendingLimitBlocked {
+		t.Fatalf("spending = %#v", spending)
 	}
 }

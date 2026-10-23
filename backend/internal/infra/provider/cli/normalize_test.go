@@ -62,7 +62,17 @@ func TestNormalizeBuildReasoningEffort(t *testing.T) {
 		{name: "minimal maps to low", model: "grok-4.6", effort: "minimal", want: "low"},
 		{name: "high", model: "grok-4.5", effort: "high", want: "high"},
 		{name: "medium", model: "grok-4.5", effort: "medium", want: "medium"},
+		// Catalog-driven menus (grok-build reasoning_efforts) override the static table.
+		{name: "catalog max forwarded verbatim", model: "grok-menu-max", effort: "max", want: "max"},
+		{name: "catalog minimal forwarded verbatim", model: "grok-menu-max", effort: "minimal", want: "minimal"},
+		{name: "catalog without xhigh folds max to high", model: "grok-menu-plain", effort: "max", want: "high"},
+		{name: "catalog without xhigh folds xhigh to high", model: "grok-menu-plain", effort: "XHIGH", want: "high"},
+		{name: "catalog without low folds minimal to low fallback", model: "grok-menu-plain", effort: "minimal", want: "low"},
 	}
+	modeldomain.ResetUpstreamProfiles()
+	t.Cleanup(modeldomain.ResetUpstreamProfiles)
+	modeldomain.RegisterUpstreamModelProfile("grok-menu-max", modeldomain.UpstreamModelProfile{ReasoningEfforts: []string{"minimal", "low", "medium", "high", "xhigh", "max"}})
+	modeldomain.RegisterUpstreamModelProfile("grok-menu-plain", modeldomain.UpstreamModelProfile{ReasoningEfforts: []string{"medium", "high"}})
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			body := []byte(`{"reasoning":{"effort":"` + test.effort + `"},"input":"hello"}`)

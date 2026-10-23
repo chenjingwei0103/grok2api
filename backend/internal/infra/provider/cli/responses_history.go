@@ -225,8 +225,8 @@ func (c *responsesToolCompatibility) normalizeFunctionCallInput(item map[string]
 		return nil, &responsesRequestError{Message: param + ".arguments 无法编码", Param: param + ".arguments", Code: "invalid_parameter"}
 	}
 	namespace := strings.TrimSpace(stringField(item, "namespace"))
-	if namespace != "" {
-		name = c.alias(responsesToolIdentity{Kind: responsesFunctionTool, Namespace: namespace, Name: name})
+	if namespace != "" || strings.EqualFold(name, "view_image") {
+		name = c.functionAlias(responsesToolIdentity{Kind: responsesFunctionTool, Namespace: namespace, Name: name})
 	}
 	// 按官方 Build 回放结构仅保留四个输入字段，避免输出态字段和私有元数据
 	// 干扰 Grok 的 untagged ModelInput 反序列化。
@@ -259,31 +259,21 @@ func (c *responsesToolCompatibility) normalizeCustomToolCallInput(item map[strin
 }
 
 func sanitizeReasoningInput(item map[string]any) map[string]any {
-	// 官方 Grok Build 回放 reasoning 时会删除 output-only status，但会保留
-	// id、summary、content 和可选 encrypted_content。密文不是回放的前置条件。
+	// Keep ciphertext-backed reasoning native. Summary-only items are rewritten
+	// as assistant messages so the readable plan survives without sending a
+	// bare type=reasoning item that Grok Build may reject.
 	converted := copyNonNullHistoryFields(item, "id", "summary", "content", "encrypted_content")
 	converted["type"] = "reasoning"
 	if encrypted, ok := converted["encrypted_content"].(string); ok && strings.TrimSpace(encrypted) != "" {
 		if _, exists := converted["summary"]; !exists {
 			converted["summary"] = []any{}
 		}
+		return converted
 	}
-	if !hasPortableReasoningContent(converted) {
-		return compatibilityBoundaryMessage("A prior model reasoning item was omitted because it has no portable content for Grok Build.")
+	if portable, ok := portableReasoningSummaryMessage(converted); ok {
+		return portable
 	}
-	return converted
-}
-
-func hasPortableReasoningContent(item map[string]any) bool {
-	if encrypted, ok := item["encrypted_content"].(string); ok && strings.TrimSpace(encrypted) != "" {
-		return true
-	}
-	for _, key := range []string{"summary", "content"} {
-		if values, ok := item[key].([]any); ok && len(values) > 0 {
-			return true
-		}
-	}
-	return false
+	return compatibilityBoundaryMessage("A prior model reasoning item was omitted because it has no portable content for Grok Build.")
 }
 
 // sanitizeNativeHistoryInput rebuilds history from native Grok Build InputItem fields

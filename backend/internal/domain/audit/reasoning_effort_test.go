@@ -9,7 +9,10 @@ func TestNormalizeReasoningEffort(t *testing.T) {
 	}{
 		{value: " XHIGH ", want: "xhigh"},
 		{value: "fixed", want: "fixed"},
-		{value: "max", want: ""},
+		// max/minimal are real grok-build wire tiers; adapters only forward them when the model menu lists them.
+		{value: "max", want: "max"},
+		{value: "MINIMAL", want: "minimal"},
+		{value: "ultra", want: ""},
 		{value: "thinking:32000", want: ""},
 		{value: "customer@example.com", want: ""},
 	}
