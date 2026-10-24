@@ -35,7 +35,13 @@ func Fetch(ctx context.Context, baseURL string, credential account.Credential, e
 	if strings.TrimSpace(token) == "" {
 		return provider.AccountIdentity{}, provider.ErrUnauthorized
 	}
-	lease, err := egress.AcquireCredential(ctx, domainegress.ScopeWeb, credential)
+	// Console accounts acquire through the Console scope so a bound Console
+	// node is honored; unbound ones still fall back to Web nodes.
+	scope := domainegress.ScopeWeb
+	if credential.Provider == account.ProviderConsole {
+		scope = domainegress.ScopeConsole
+	}
+	lease, err := egress.AcquireCredential(ctx, scope, credential)
 	if err != nil {
 		return provider.AccountIdentity{}, err
 	}
